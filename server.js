@@ -8,7 +8,6 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// Support any token address
 app.get('/api/dexscreener/:address', async (req, res) => {
   try {
     const { address } = req.params;
@@ -22,9 +21,14 @@ app.get('/api/dexscreener/:address', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Memecoin Tracker API is running' });
+  res.json({ 
+    status: 'Memecoin Tracker API is running', 
+    timestamp: new Date(),
+    uptime: process.uptime()
+  });
 });
 
-app.listen(PORT, () => {
+// CRITICAL: Bind to 0.0.0.0 for Render
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
