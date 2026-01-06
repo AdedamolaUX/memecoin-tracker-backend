@@ -3,21 +3,28 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3001;
 
-app.get('/api/dexscreener/:token', async (req, res) => {
+app.use(cors());
+app.use(express.json());
+
+// Support any token address
+app.get('/api/dexscreener/:address', async (req, res) => {
   try {
-    const token = req.params.token;
-    const url = 'https://api.dexscreener.com/latest/dex/tokens/' + token;
-    const response = await fetch(url);
+    const { address } = req.params;
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
     const data = await response.json();
     res.json(data);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Failed to fetch data' });
   }
 });
 
-const PORT = 3001;
+app.get('/', (req, res) => {
+  res.json({ status: 'Memecoin Tracker API is running' });
+});
+
 app.listen(PORT, () => {
-  console.log('Server running on http://localhost:3001');
+  console.log(`Server running on port ${PORT}`);
 });
