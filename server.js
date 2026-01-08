@@ -5,9 +5,6 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// === YOUR MORALIS API KEY (added for better pumping detection) ===
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImEyMjUyZTcwLWQ1NGYtNDc2Zi04NzdlLTA1YmMzZjZkOGNmNSIsIm9yZ0lkIjoiNDg5MjY0IiwidXNlcklkIjoiNTAzMzkzIiwidHlwZUlkIjoiNTM5NmE0NmMtOGE3OC00NWI1LThlOWMtZDY0OTA4YmJjMWU2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc4NjI4NjMsImV4cCI6NDkyMzYyMjg2M30.YK8NJCVztDL39VYA1fMwyCL__3_lidUSFKbYFK8qcSQ';
-
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
@@ -76,7 +73,7 @@ async function getTokenMarketCap(address) {
         marketCap: pair.fdv || pair.marketCap || 0,
         priceUsd: parseFloat(pair.priceUsd) || 0,
         liquidity: pair.liquidity?.usd || 0,
-        age: pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : null
+        age: pair.pairCreatedAt ? Date.now() - new Date(pair.pairCreatedAt).getTime() : null
       };
     }
   } catch (err) {
@@ -85,7 +82,7 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
 }
 
-// Helper functions
+// Helper functions (unchanged)
 function generateSolanaAddress() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789';
   let result = '';
@@ -114,8 +111,9 @@ function findCommonTokensInWallets(wallets) {
   return common;
 }
 
-// ANALYZE WALLET
+// ANALYZE WALLET (unchanged)
 app.get('/api/wallet/:address', async (req, res) => {
+  // ... (exact same as your current code - no changes needed here)
   try {
     const { address } = req.params;
     
@@ -229,38 +227,34 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// AUTO-DISCOVERY WITH MORALIS (replaced DexScreener search for better pumping detection)
+// AUTO-DISCOVERY WITH DEXSCREENER (Free & Reliable for Pumping Tokens)
 app.get('/api/discover', async (req, res) => {
   try {
     const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
     const minPumpPercent = parseInt(req.query.minPump) || 100;
     
-    console.log('Starting REAL auto-discovery with Moralis...');
+    console.log('Starting auto-discovery with DexScreener...');
     console.log('Filters: MC <', maxMarketCap, '| Pump >', minPumpPercent + '%');
     
-    // Step 1: Find pumped tokens ON SOLANA using Moralis trending endpoint
-    const trendingUrl = 'https://deep-index.moralis.io/api/v2.2/tokens/trending?chain=solana';
-    const trendingResponse = await fetch(trendingUrl, {
-      headers: { 'X-API-Key': MORALIS_API_KEY }
-    });
-    const trendingData = await trendingResponse.json();
+    // Step 1: Search DexScreener for pumping Solana tokens
+    const searchUrl = 'https://api.dexscreener.com/latest/dex/search?q=solana';
+    const searchResponse = await fetch(searchUrl);
+    const searchData = await searchResponse.json();
     
-    if (!trendingData || !trendingData.tokens) {
+    if (!searchData || !searchData.pairs || searchData.pairs.length === 0) {
       return res.json({ 
-        error: 'No tokens found from Moralis', 
+        error: 'No pairs found on DexScreener', 
         discoveredWallets: []
       });
     }
     
-    const pumpedTokens = trendingData.tokens
-      .filter(token => {
-        const change24h = token.price_change_24h || 0;
-        const volume = token.volume_24h || 0;
-        return change24h > minPumpPercent && volume > 50000;
-      })
-      .slice(0, 3); // Top 3 pumped tokens
+    const pumpedTokens = searchData.pairs
+      .filter(pair => pair.chainId === 'solana' &&
+        pair.priceChange?.h24 > minPumpPercent &&
+        pair.volume?.h24 > 50000)
+      .slice(0, 3); // Top 3 pumped
     
-    console.log('Found', pumpedTokens.length, 'pumped Solana tokens from Moralis');
+    console.log('Found', pumpedTokens.length, 'pumped Solana tokens');
     
     if (pumpedTokens.length === 0) {
       return res.json({
@@ -268,29 +262,24 @@ app.get('/api/discover', async (req, res) => {
         discoveredWallets: [],
         analyzedTokens: 0,
         totalWalletsFound: 0,
-        message: 'No Solana tokens found matching criteria. Try lowering minPump parameter.',
+        message: 'No pumping tokens found. Try lowering minPump (e.g., ?minPump=50).',
         filters: { maxMarketCap, minPumpPercent }
       });
     }
     
-    // Step 2: Get REAL wallet addresses from token transactions (using Helius - unchanged)
+    // Step 2-3: Same Helius wallet logic (unchanged)
     const walletScores = {};
     
-    for (const token of pumpedTokens) {
-      const mintAddress = token.address; // Moralis uses "address" for mint
-      console.log('Getting transactions for:', token.symbol, '(' + mintAddress + ')');
+    for (const pair of pumpedTokens) {
+      const mintAddress = pair.baseToken.address;
+      console.log('Getting transactions for:', pair.baseToken.symbol, '(' + mintAddress + ')');
       
       try {
         const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
         const txResponse = await fetch(txUrl);
         const transactions = await txResponse.json();
         
-        if (!transactions || transactions.length === 0) {
-          console.log('No transactions for', token.symbol);
-          continue;
-        }
-        
-        console.log('Found', transactions.length, 'transactions for', token.symbol);
+        if (!transactions || transactions.length === 0) continue;
         
         const wallets = new Set();
         
@@ -301,7 +290,6 @@ app.get('/api/discover', async (req, res) => {
               if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
             }
           }
-          
           if (tx.accountData) {
             for (const account of tx.accountData) {
               if (account.account) wallets.add(account.account);
@@ -309,32 +297,23 @@ app.get('/api/discover', async (req, res) => {
           }
         }
         
-        console.log('Found', wallets.size, 'unique wallets for', token.symbol);
-        
         for (const walletAddr of wallets) {
           if (!walletScores[walletAddr]) {
-            walletScores[walletAddr] = {
-              address: walletAddr,
-              tokensFound: [],
-              score: 0
-            };
+            walletScores[walletAddr] = { address: walletAddr, tokensFound: [], score: 0 };
           }
-          
-          walletScores[walletAddr].score += Math.abs(token.price_change_24h || 0);
+          walletScores[walletAddr].score += Math.abs(pair.priceChange.h24);
           walletScores[walletAddr].tokensFound.push({
-            symbol: token.symbol,
-            pumpPercent: token.price_change_24h || 0
+            symbol: pair.baseToken.symbol,
+            pumpPercent: pair.priceChange.h24
           });
         }
         
         await new Promise(r => setTimeout(r, 500));
-        
       } catch (err) {
-        console.error('Error getting transactions for', token.symbol, ':', err.message);
+        console.error('Error:', err.message);
       }
     }
     
-    // Step 3: Rank and return top wallets
     const discoveredWallets = Object.values(walletScores)
       .filter(w => w.tokensFound.length >= 1)
       .sort((a, b) => b.score - a.score)
@@ -348,11 +327,9 @@ app.get('/api/discover', async (req, res) => {
         discoveredAt: new Date().toISOString()
       }));
     
-    console.log('Discovery complete. Found', discoveredWallets.length, 'REAL wallets');
-    
     res.json({
       success: true,
-      discoveredWallets: discoveredWallets,
+      discoveredWallets,
       analyzedTokens: pumpedTokens.length,
       totalWalletsFound: Object.keys(walletScores).length,
       filters: { maxMarketCap, minPumpPercent },
@@ -365,7 +342,7 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// DEXSCREENER (kept as fallback)
+// Keep your other endpoints unchanged
 app.get('/api/dexscreener/:address', async (req, res) => {
   try {
     const { address } = req.params;
@@ -377,20 +354,18 @@ app.get('/api/dexscreener/:address', async (req, res) => {
   }
 });
 
-// HOME
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'LOW CAP HUNTER API - REAL Wallet Discovery (Now with Moralis!)',
+    status: 'LOW CAP HUNTER API - Now with DexScreener pumping detection!',
     endpoints: {
       wallet: '/api/wallet/:address?maxMC=1000000&minRate=40&minTrades=3',
-      discover: '/api/discover?maxMC=1000000&minPump=100',
+      discover: '/api/discover?minPump=100',
       dexscreener: '/api/dexscreener/:address'
     },
     timestamp: new Date() 
   });
 });
 
-// Start server
 app.use(cors());
 app.use(express.json());
 
