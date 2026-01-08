@@ -85,7 +85,7 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
 }
 
-// Helper functions (kept for backward compatibility but not used in discovery)
+// Helper functions
 function generateSolanaAddress() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789';
   let result = '';
@@ -229,17 +229,16 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// AUTO-DISCOVERY - FIXED VERSION WITH REAL WALLET ADDRESSES
+// AUTO-DISCOVERY WITH REAL WALLET ADDRESSES
 app.get('/api/discover', async (req, res) => {
   try {
     const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
     const minPumpPercent = parseInt(req.query.minPump) || 100;
-    const limit = parseInt(req.query.limit) || 10; // How many wallets to return
     
     console.log('Starting REAL auto-discovery...');
     console.log('Filters: MC <', maxMarketCap, '| Pump >', minPumpPercent + '%');
     
-    // Step 1: Find tokens that recently pumped
+    // Step 1: Find pumped tokens
     const searchUrl = 'https://api.dexscreener.com/latest/dex/search?q=solana';
     const searchResponse = await fetch(searchUrl);
     const searchData = await searchResponse.json();
@@ -257,63 +256,54 @@ app.get('/api/discover', async (req, res) => {
         const volume = pair.volume?.h24 || 0;
         return change24h > minPumpPercent && volume > 50000;
       })
-      .slice(0, 3); // Analyze top 3 pumped tokens
+      .slice(0, 3); // Top 3 pumped tokens
     
     console.log('Found', pumpedTokens.length, 'pumped tokens');
     
-    // Step 2: For each token, get REAL early buyer wallets
-    const walletScores = {}; // Track wallets across multiple tokens
+    // Step 2: Get REAL wallet addresses from token transactions
+    const walletScores = {};
     
     for (const token of pumpedTokens) {
       const mintAddress = token.baseToken.address;
-      console.log('Analyzing token:', token.baseToken.symbol, mintAddress);
+      console.log('Getting transactions for:', token.baseToken.symbol);
       
       try {
-        // Get token's transaction signatures
-        const sigUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const sigResponse = await fetch(sigUrl);
-        const transactions = await sigResponse.json();
+        // Get transactions for this token
+        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+        const txResponse = await fetch(txUrl);
+        const transactions = await txResponse.json();
         
         if (!transactions || transactions.length === 0) {
-          console.log('No transactions found for', token.baseToken.symbol);
+          console.log('No transactions for', token.baseToken.symbol);
           continue;
         }
         
         console.log('Found', transactions.length, 'transactions for', token.baseToken.symbol);
         
-        // Step 3: Extract buyer wallets from transactions
-        const buyers = new Set();
+        // Extract wallet addresses from transactions
+        const wallets = new Set();
         
         for (const tx of transactions) {
-          // Look for swap transactions
-          if (tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)) {
-            
-            // Find wallets that received this token (buyers)
-            if (tx.tokenTransfers) {
-              for (const transfer of tx.tokenTransfers) {
-                if (transfer.mint === mintAddress && 
-                    transfer.toUserAccount && 
-                    transfer.toUserAccount !== mintAddress) {
-                  buyers.add(transfer.toUserAccount);
-                }
-              }
+          // Get wallets from token transfers
+          if (tx.tokenTransfers) {
+            for (const transfer of tx.tokenTransfers) {
+              if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
+              if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
             }
-            
-            // Also check account data
-            if (tx.accountData) {
-              for (const account of tx.accountData) {
-                if (account.account && account.account !== mintAddress) {
-                  buyers.add(account.account);
-                }
-              }
+          }
+          
+          // Get wallets from account data
+          if (tx.accountData) {
+            for (const account of tx.accountData) {
+              if (account.account) wallets.add(account.account);
             }
           }
         }
         
-        console.log('Found', buyers.size, 'unique buyers for', token.baseToken.symbol);
+        console.log('Found', wallets.size, 'unique wallets for', token.baseToken.symbol);
         
-        // Step 4: Score these wallets
-        for (const walletAddr of buyers) {
+        // Score these wallets
+        for (const walletAddr of wallets) {
           if (!walletScores[walletAddr]) {
             walletScores[walletAddr] = {
               address: walletAddr,
@@ -322,45 +312,41 @@ app.get('/api/discover', async (req, res) => {
             };
           }
           
-          // Add points for finding wallet in a pumped token
-          walletScores[walletAddr].score += Math.floor(token.priceChange.h24);
+          walletScores[walletAddr].score += token.priceChange.h24;
           walletScores[walletAddr].tokensFound.push({
             symbol: token.baseToken.symbol,
-            pumpPercent: token.priceChange.h24,
-            volume: token.volume.h24
+            pumpPercent: token.priceChange.h24
           });
         }
         
-        // Rate limiting
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 500)); // Rate limit
         
       } catch (err) {
-        console.error('Error analyzing token', token.baseToken.symbol, ':', err.message);
+        console.error('Error getting transactions for', token.baseToken.symbol, ':', err.message);
       }
     }
     
-    // Step 5: Rank wallets by score and return top performers
-    const rankedWallets = Object.values(walletScores)
-      .filter(w => w.tokensFound.length >= 1) // Must have traded at least 1 pumped token
+    // Step 3: Rank and return top wallets
+    const discoveredWallets = Object.values(walletScores)
+      .filter(w => w.tokensFound.length >= 1)
       .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
+      .slice(0, 10)
       .map((wallet, index) => ({
         rank: index + 1,
         address: wallet.address,
-        score: wallet.score,
+        score: Math.floor(wallet.score),
         tokensFound: wallet.tokensFound,
         discoveredFrom: wallet.tokensFound.map(t => t.symbol).join(', '),
-        avgPump: Math.floor(wallet.tokensFound.reduce((sum, t) => sum + t.pumpPercent, 0) / wallet.tokensFound.length),
         discoveredAt: new Date().toISOString()
       }));
     
-    console.log('Discovery complete. Found', rankedWallets.length, 'REAL wallets');
+    console.log('Discovery complete. Found', discoveredWallets.length, 'REAL wallets');
     
     res.json({
       success: true,
-      discoveredWallets: rankedWallets,
+      discoveredWallets: discoveredWallets,
       analyzedTokens: pumpedTokens.length,
-      totalWalletsScanned: Object.keys(walletScores).length,
+      totalWalletsFound: Object.keys(walletScores).length,
       filters: { maxMarketCap, minPumpPercent },
       timestamp: new Date()
     });
@@ -389,7 +375,7 @@ app.get('/', (req, res) => {
     status: 'LOW CAP HUNTER API - REAL Wallet Discovery',
     endpoints: {
       wallet: '/api/wallet/:address?maxMC=1000000&minRate=40&minTrades=3',
-      discover: '/api/discover?maxMC=1000000&minPump=100&limit=10',
+      discover: '/api/discover?maxMC=1000000&minPump=100',
       dexscreener: '/api/dexscreener/:address'
     },
     timestamp: new Date() 
