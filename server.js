@@ -229,7 +229,7 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// AUTO-DISCOVERY WITH REAL WALLET ADDRESSES
+// AUTO-DISCOVERY WITH SOLANA CHAIN FILTER
 app.get('/api/discover', async (req, res) => {
   try {
     const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
@@ -238,7 +238,7 @@ app.get('/api/discover', async (req, res) => {
     console.log('Starting REAL auto-discovery...');
     console.log('Filters: MC <', maxMarketCap, '| Pump >', minPumpPercent + '%');
     
-    // Step 1: Find pumped tokens
+    // Step 1: Find pumped tokens ON SOLANA CHAIN
     const searchUrl = 'https://api.dexscreener.com/latest/dex/search?q=solana';
     const searchResponse = await fetch(searchUrl);
     const searchData = await searchResponse.json();
@@ -254,18 +254,32 @@ app.get('/api/discover', async (req, res) => {
       .filter(pair => {
         const change24h = pair.priceChange?.h24 || 0;
         const volume = pair.volume?.h24 || 0;
-        return change24h > minPumpPercent && volume > 50000;
+        // CRITICAL FIX: Only get actual Solana chain tokens
+        return pair.chainId === 'solana' &&
+               change24h > minPumpPercent && 
+               volume > 50000;
       })
       .slice(0, 3); // Top 3 pumped tokens
     
-    console.log('Found', pumpedTokens.length, 'pumped tokens');
+    console.log('Found', pumpedTokens.length, 'pumped Solana tokens');
+    
+    if (pumpedTokens.length === 0) {
+      return res.json({
+        success: true,
+        discoveredWallets: [],
+        analyzedTokens: 0,
+        totalWalletsFound: 0,
+        message: 'No Solana tokens found matching criteria. Try lowering minPump parameter.',
+        filters: { maxMarketCap, minPumpPercent }
+      });
+    }
     
     // Step 2: Get REAL wallet addresses from token transactions
     const walletScores = {};
     
     for (const token of pumpedTokens) {
       const mintAddress = token.baseToken.address;
-      console.log('Getting transactions for:', token.baseToken.symbol);
+      console.log('Getting transactions for:', token.baseToken.symbol, '(' + mintAddress + ')');
       
       try {
         // Get transactions for this token
@@ -312,7 +326,7 @@ app.get('/api/discover', async (req, res) => {
             };
           }
           
-          walletScores[walletAddr].score += token.priceChange.h24;
+          walletScores[walletAddr].score += Math.abs(token.priceChange.h24);
           walletScores[walletAddr].tokensFound.push({
             symbol: token.baseToken.symbol,
             pumpPercent: token.priceChange.h24
