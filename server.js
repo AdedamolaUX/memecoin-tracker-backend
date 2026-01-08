@@ -10,37 +10,26 @@ app.use(express.json());
 
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
-// Cache for token metadata
 let tokenCache = {};
 
-// Load Solana token registry on startup
+// Load token registry
 async function loadTokenRegistry() {
   try {
     const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
     const data = await response.json();
-    
-    // Build lookup map
     data.tokens.forEach(token => {
-      tokenCache[token.address] = {
-        symbol: token.symbol,
-        name: token.name
-      };
+      tokenCache[token.address] = { symbol: token.symbol, name: token.name };
     });
-    
     console.log(`✅ Loaded ${Object.keys(tokenCache).length} tokens from registry`);
   } catch (err) {
     console.error('Failed to load token registry:', err.message);
   }
 }
 
-// Get token metadata from multiple sources
+// Get token metadata
 async function getTokenMetadata(address) {
-  // Check cache first
-  if (tokenCache[address]) {
-    return tokenCache[address];
-  }
+  if (tokenCache[address]) return tokenCache[address];
   
-  // Try Helius API first
   try {
     const url = `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`;
     const response = await fetch(url, {
@@ -48,53 +37,67 @@ async function getTokenMetadata(address) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mintAccounts: [address] })
     });
-    
     const data = await response.json();
     if (data && data[0] && data[0].symbol && data[0].symbol !== 'UNKNOWN') {
-      const metadata = {
-        symbol: data[0].symbol,
-        name: data[0].name || data[0].symbol
-      };
+      const metadata = { symbol: data[0].symbol, name: data[0].name || data[0].symbol };
       tokenCache[address] = metadata;
       return metadata;
     }
   } catch (err) {
-    console.log('Helius metadata fetch failed:', err.message);
+    console.log('Helius failed:', err.message);
   }
   
-  // Try DexScreener as fallback for new tokens
   try {
     const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
     const dexResponse = await fetch(dexUrl);
     const dexData = await dexResponse.json();
-    
     if (dexData && dexData.pairs && dexData.pairs[0]) {
       const pair = dexData.pairs[0];
-      const metadata = {
-        symbol: pair.baseToken.symbol || 'UNKNOWN',
-        name: pair.baseToken.name || 'Unknown Token'
-      };
+      const metadata = { symbol: pair.baseToken.symbol, name: pair.baseToken.name };
       tokenCache[address] = metadata;
       return metadata;
     }
   } catch (err) {
-    console.log('DexScreener metadata fetch failed:', err.message);
+    console.log('DexScreener failed:', err.message);
   }
   
-  // Final fallback: return shortened address
-  return {
-    symbol: address.slice(0, 4) + '...' + address.slice(-4),
-    name: 'Unknown Token'
-  };
+  return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
 }
 
-// Get real wallet analysis with token names
+// Get current market cap from DexScreener
+async function getTokenMarketCap(address) {
+  try {
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const data = await response.json();
+    
+    if (data && data.pairs && data.pairs[0]) {
+      const pair = data.pairs[0];
+      return {
+        marketCap: pair.fdv || pair.marketCap || 0,
+        priceUsd: parseFloat(pair.priceUsd) || 0,
+        liquidity: pair.liquidity?.usd || 0,
+        age: pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : null
+      };
+    }
+  } catch (err) {
+    console.log('Market cap fetch failed:', err.message);
+  }
+  return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
+}
+
+// Analyze wallet with CUSTOMIZABLE market cap filter
 app.get('/api/wallet/:address', async (req, res) => {
   try {
     const { address } = req.params;
-    console.log('Fetching wallet data for:', address);
     
-    // Get transactions from Helius
+    // Get filter settings from query params (with defaults)
+    const maxMarketCap = parseInt(req.query.maxMC) || 1000000; // Default $1M
+    const minSuccessRate = parseInt(req.query.minRate) || 40; // Default 40%
+    const minLowCapTrades = parseInt(req.query.minTrades) || 3; // Default 3 trades
+    
+    console.log(`🔍 Analyzing wallet: ${address}`);
+    console.log(⚙️ Filters: MC < $${maxMarketCap.toLocaleString()}, Success Rate > ${minSuccessRate}%, Min Trades > ${minLowCapTrades}`);
+    
     const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
     const response = await fetch(url);
     const transactions = await response.json();
@@ -102,61 +105,101 @@ app.get('/api/wallet/:address', async (req, res) => {
     if (!transactions || transactions.length === 0) {
       return res.json({
         address,
+        isEarlyEntrySpecialist: false,
+        lowCapEntries: 0,
         totalTrades: 0,
-        winRate: 0,
-        totalProfit: 0,
-        recentTokens: [],
-        lastActive: null,
+        earlyEntryRate: 0,
+        successfulLowCapExits: 0,
+        filters: { maxMarketCap, minSuccessRate, minLowCapTrades },
         error: 'No transactions found'
       });
     }
     
-    // Analyze transactions
     const swaps = transactions.filter(tx => 
-      tx.type === 'SWAP' || 
-      (tx.tokenTransfers && tx.tokenTransfers.length > 0)
+      tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
     );
     
-    // Extract unique tokens
+    // Extract tokens
     const tokenSet = new Set();
-    swaps.forEach(tx => {
+    const tokenEntries = {};
+    
+    for (const tx of swaps) {
       if (tx.tokenTransfers) {
-        tx.tokenTransfers.forEach(transfer => {
-          if (transfer.mint) {
+        for (const transfer of tx.tokenTransfers) {
+          if (transfer.mint && transfer.mint !== 'So11111111111111111111111111111111111111112') {
             tokenSet.add(transfer.mint);
+            if (!tokenEntries[transfer.mint]) {
+              tokenEntries[transfer.mint] = { firstSeen: tx.timestamp, address: transfer.mint };
+            }
           }
-        });
+        }
       }
-    });
+    }
     
-    // Get token metadata for each
-    const recentTokenAddresses = Array.from(tokenSet).slice(0, 5);
-    const recentTokens = [];
+    console.log(`📊 Found ${tokenSet.size} unique tokens`);
     
-    for (const tokenAddr of recentTokenAddresses) {
+    let lowCapEntries = 0;
+    let successfulLowCapTrades = 0;
+    const analyzedTokens = [];
+    
+    const recentTokens = Array.from(tokenSet).slice(0, 5);
+    
+    for (const tokenAddr of recentTokens) {
       const metadata = await getTokenMetadata(tokenAddr);
-      recentTokens.push({
+      const mcData = await getTokenMarketCap(tokenAddr);
+      
+      // Check if meets LOW CAP criteria based on user's filter
+      const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
+      const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
+      
+      if (meetsLowCapCriteria || isVeryNew) {
+        lowCapEntries++;
+        // Check if it pumped after they bought (10x from filter threshold)
+        if (mcData.marketCap > maxMarketCap * 10) {
+          successfulLowCapTrades++;
+        }
+      }
+      
+      analyzedTokens.push({
         address: tokenAddr,
         symbol: metadata.symbol,
-        name: metadata.name
+        name: metadata.name,
+        currentMC: mcData.marketCap,
+        meetsFilter: meetsLowCapCriteria,
+        isNew: isVeryNew,
+        firstTradedBy: new Date(tokenEntries[tokenAddr].firstSeen * 1000).toISOString()
       });
+      
+      await new Promise(r => setTimeout(r, 300));
     }
+    
+    const earlyEntryRate = swaps.length > 0 ? Math.floor((lowCapEntries / Math.min(swaps.length, 20)) * 100) : 0;
+    const isSpecialist = lowCapEntries >= minLowCapTrades && earlyEntryRate >= minSuccessRate;
     
     const analysis = {
       address,
+      isEarlyEntrySpecialist: isSpecialist,
+      lowCapEntries: lowCapEntries,
       totalTrades: swaps.length,
-      winRate: swaps.length > 0 ? Math.floor(60 + Math.random() * 30) : 0,
-      totalProfit: swaps.length * 1000,
-      recentTokens: recentTokens,
+      earlyEntryRate: earlyEntryRate,
+      successfulLowCapExits: successfulLowCapTrades,
+      score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
+      analyzedTokens: analyzedTokens,
       lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
-      rawTransactionCount: transactions.length
+      specialistBadge: isSpecialist ? '🎯 EARLY ENTRY SPECIALIST' : null,
+      filters: {
+        maxMarketCap,
+        minSuccessRate,
+        minLowCapTrades
+      }
     };
     
-    console.log('Analysis complete:', analysis);
+    console.log(`✅ Result: ${isSpecialist ? 'SPECIALIST' : 'Regular'} | Low cap: ${lowCapEntries} | Rate: ${earlyEntryRate}%`);
+    
     res.json(analysis);
     
   } catch (error) {
-    console.error('Wallet analysis error:', error);
+    console.error('❌ Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -164,33 +207,4 @@ app.get('/api/wallet/:address', async (req, res) => {
 // DexScreener endpoint
 app.get('/api/dexscreener/:address', async (req, res) => {
   try {
-    const { address } = req.params;
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.json({ 
-    status: '🔥 Live Trading API - Real Blockchain Data',
-    apis: {
-      helius: 'Connected',
-      dexscreener: 'Connected',
-      tokenRegistry: 'Connected'
-    },
-    tokensCached: Object.keys(tokenCache).length,
-    timestamp: new Date() 
-  });
-});
-
-// Load token registry on startup
-loadTokenRegistry();
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Real trading API running on port ${PORT}`);
-  console.log(`🔗 Helius API: Connected`);
-  console.log(`📊 Multi-source token metadata: Ready`);
-});
+    const { ad
