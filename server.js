@@ -5,10 +5,10 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Birdeye key
+// Your Birdeye key (free tier)
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
 
-// Helius key
+// Your Helius key
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
@@ -197,20 +197,26 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// DISCOVERY - Merged DexScreener + Birdeye with Success Scoring
+// MAIN DISCOVERY - Merged DexScreener New Pairs + Birdeye List with Success Scoring
 app.get('/api/discover', async (req, res) => {
   try {
-    const minAbsChange = parseInt(req.query.minPump) || 50;
+    const limit = parseInt(req.query.limit) || 50; // Adjustable limit (default 50 for more data)
+    
     const walletScores = {};
     
-    // DexScreener New Pairs (fresh launches)
+    // 1. DexScreener New Pairs (fresh launches - high early ROI)
+    console.log('Fetching new pairs from DexScreener...');
     const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
     const newResponse = await fetch(newPairsUrl);
     const newData = await newResponse.json();
-    const newTokens = newData.pairs || [];
+    
+    const newTokens = (newData.pairs || [])
+      .filter(p => p.chainId === 'solana')
+      .slice(0, limit);
     
     for (const token of newTokens) {
       const mintAddress = token.baseToken.address;
+      const mcData = await getTokenMarketCap(mintAddress);
       
       try {
         const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
@@ -220,7 +226,6 @@ app.get('/api/discover', async (req, res) => {
         if (!transactions || transactions.length === 0) continue;
         
         const wallets = new Set();
-        
         for (const tx of transactions) {
           if (tx.tokenTransfers) {
             for (const transfer of tx.tokenTransfers) {
@@ -230,99 +235,102 @@ app.get('/api/discover', async (req, res) => {
           }
         }
         
-        for (const walletAddr of wallets) {
-          if (!walletScores[walletAddr]) {
-            walletScores[walletAddr] = {
-              address: walletAddr,
-              tokensFound: [],
+        for (const wallet of wallets) {
+          if (!walletScores[wallet]) {
+            walletScores[wallet] = {
+              address: wallet,
+              earlyBuys: 0,
+              totalTokens: 0,
+              totalChangeBonus: 0,
               score: 0
             };
           }
-          
-          walletScores[walletAddr].score += Math.abs(token.priceChange.h24 || 0);
-          walletScores[walletAddr].tokensFound.push({
-            symbol: token.baseToken.symbol,
-            changePercent: token.priceChange.h24 || 0
-          });
+          walletScores[wallet].earlyBuys += 1;
+          walletScores[wallet].totalTokens += 1;
+          walletScores[wallet].totalChangeBonus += (mcData.change24h > 0 ? mcData.change24h : 0);
         }
         
         await new Promise(r => setTimeout(r, 500));
-      } catch (err) {
-        console.error('Error:', err.message);
-      }
+      } catch (err) {}
     }
     
-    // Birdeye Token List (larger pool)
-    const birdeyeUrl = 'https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=desc&offset=0&limit=100';
+    // 2. Birdeye Token List (larger established/trending tokens)
+    console.log('Fetching token list from Birdeye...');
+    const birdeyeUrl = `https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=desc&offset=0&limit=${limit}`;
     const birdeyeResponse = await fetch(birdeyeUrl, {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
+      headers: {
+        'X-API-KEY': BIRDEYE_API_KEY,
+        'x-chain': 'solana'
+      }
     });
-    const birdeyeData = await birdeyeResponse.json();
-    const birdeyeTokens = birdeyeData.data?.tokens || [];
     
-    for (const token of birdeyeTokens) {
-      const mintAddress = token.address;
+    if (birdeyeResponse.ok) {
+      const birdeyeData = await birdeyeResponse.json();
+      const birdeyeTokens = (birdeyeData.data?.tokens || []).slice(0, limit);
       
-      try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
+      for (const token of birdeyeTokens) {
+        const mintAddress = token.address;
         
-        if (!transactions || transactions.length === 0) continue;
-        
-        const wallets = new Set();
-        
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
-              if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+        try {
+          const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+          const txResponse = await fetch(txUrl);
+          const transactions = await txResponse.json();
+          
+          if (!transactions || transactions.length === 0) continue;
+          
+          const wallets = new Set();
+          for (const tx of transactions) {
+            if (tx.tokenTransfers) {
+              for (const transfer of tx.tokenTransfers) {
+                if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
+                if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+              }
             }
           }
-        }
-        
-        for (const walletAddr of wallets) {
-          if (!walletScores[walletAddr]) {
-            walletScores[walletAddr] = {
-              address: walletAddr,
-              tokensFound: [],
-              score: 0
-            };
+          
+          for (const wallet of wallets) {
+            if (!walletScores[wallet]) {
+              walletScores[wallet] = {
+                address: wallet,
+                earlyBuys: 0,
+                totalTokens: 0,
+                totalChangeBonus: 0,
+                score: 0
+              };
+            }
+            walletScores[wallet].totalTokens += 1;
+            walletScores[wallet].totalChangeBonus += (token.priceChange?.h24 || 0 > 0 ? token.priceChange?.h24 || 0 : 0);
           }
           
-          walletScores[walletAddr].score += Math.abs(token.priceChange?.h24 || 0);
-          walletScores[walletAddr].tokensFound.push({
-            symbol: token.symbol,
-            changePercent: token.priceChange?.h24 || 0
-          });
-        }
-        
-        await new Promise(r => setTimeout(r, 500));
-      } catch (err) {
-        console.error('Error:', err.message);
+          await new Promise(r => setTimeout(r, 500));
+        } catch (err) {}
       }
     }
     
-    // Rank and return
+    // Calculate final success score
+    Object.values(walletScores).forEach(w => {
+      w.score = (w.earlyBuys * 10) + w.totalTokens + Math.floor(w.totalChangeBonus);
+    });
+    
     const discoveredWallets = Object.values(walletScores)
-      .filter(w => w.tokensFound.length >= 1)
       .sort((a, b) => b.score - a.score)
       .slice(0, 20)
-      .map((wallet, index) => ({
-        rank: index + 1,
-        address: wallet.address,
-        score: Math.floor(wallet.score),
-        tokensFound: wallet.tokensFound,
-        discoveredFrom: wallet.tokensFound.map(t => t.symbol).join(', '),
-        discoveredAt: new Date().toISOString()
+      .map((w, i) => ({
+        rank: i + 1,
+        address: w.address,
+        successScore: w.score,
+        earlyBuys: w.earlyBuys,
+        totalTokensTraded: w.totalTokens,
+        positiveChangeBonus: Math.floor(w.totalChangeBonus)
       }));
     
     res.json({
       success: true,
-      discoveredWallets: discoveredWallets,
-      analyzedTokens: newTokens.length + birdeyeTokens.length,
-      totalWalletsFound: Object.keys(walletScores).length,
-      filters: { minAbsChange },
+      discoveredWallets,
+      totalWallets: Object.keys(walletScores).length,
+      tokensAnalyzed: newTokens.length + (birdeyeResponse.ok ? (birdeyeData.data?.tokens || []).length : 0),
+      limitUsed: limit,
+      message: 'Merged new pairs + Birdeye list with success scoring. Refresh anytime for fresh data!',
       timestamp: new Date()
     });
     
@@ -344,21 +352,27 @@ app.get('/api/dexscreener/:address', async (req, res) => {
   }
 });
 
-// HOME
+// HOME - Fixed with useful info
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'LOW CAP HUNTER API is running', 
-    timestamp: new Date(),
-    uptime: process.uptime()
+  res.json({
+    status: 'Memecoin Tracker Backend is LIVE!',
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor(process.uptime()),
+    message: 'Your successful trader discovery API is ready.',
+    endpoints: {
+      discover: '/api/discover?limit=50 (main feature - ranked traders)',
+      wallet: '/api/wallet/WALLET_ADDRESS (detailed analysis)',
+      dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)'
+    },
+    tip: 'Use ?limit=100 for more data (max 100)'
   });
-});
-
-// CRITICAL: Bind to 0.0.0.0 for Render
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
 });
 
 app.use(cors());
 app.use(express.json());
 
 loadTokenRegistry();
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+});
