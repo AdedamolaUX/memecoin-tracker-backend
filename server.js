@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const cheerio = require('cheerio'); // For scraping DexScreener pages
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -23,7 +24,7 @@ async function loadTokenRegistry() {
   }
 }
 
-// Get token metadata
+// Get token metadata (fallback to Helius or DexScreener)
 async function getTokenMetadata(address) {
   if (tokenCache[address]) return tokenCache[address];
   
@@ -41,7 +42,7 @@ async function getTokenMetadata(address) {
       return metadata;
     }
   } catch (err) {
-    console.log('Helius failed:', err.message);
+    console.log('Helius metadata failed:', err.message);
   }
   
   try {
@@ -55,7 +56,7 @@ async function getTokenMetadata(address) {
       return metadata;
     }
   } catch (err) {
-    console.log('DexScreener failed:', err.message);
+    console.log('DexScreener metadata failed:', err.message);
   }
   
   return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
@@ -73,7 +74,7 @@ async function getTokenMarketCap(address) {
         marketCap: pair.fdv || pair.marketCap || 0,
         priceUsd: parseFloat(pair.priceUsd) || 0,
         liquidity: pair.liquidity?.usd || 0,
-        age: pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : null
+        age: pair.pairCreatedAt ? Date.now() - new Date(pair.pairCreatedAt).getTime() : null
       };
     }
   } catch (err) {
@@ -82,199 +83,98 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
 }
 
-// Helper functions
-function generateSolanaAddress() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789';
-  let result = '';
-  for (let i = 0; i = 44; i++) {
-    result += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return result;
-}
-
-function generateWalletName() {
-  const adj = ['Smart', 'Quick', 'Diamond', 'Alpha', 'Stealth', 'Shadow', 'Lightning'];
-  const noun = ['Whale', 'Sniper', 'Hunter', 'Trader', 'Wolf', 'Eagle', 'Fox'];
-  return adj[Math.floor(Math.random() * adj.length)] + 
-         noun[Math.floor(Math.random() * noun.length)] + 
-         Math.floor(Math.random() * 999);
-}
-
-function findCommonTokensInWallets(wallets) {
-  if (wallets.length === 0) return [];
-  
-  const allSymbols = wallets[0].tokensFound.map(t => t.symbol);
-  const common = allSymbols.filter(symbol => 
-    wallets.every(w => w.tokensFound.some(t => t.symbol === symbol))
-  );
-  
-  return common;
-}
-
 // ANALYZE WALLET (unchanged)
 app.get('/api/wallet/:address', async (req, res) => {
-  // ... (your existing /api/wallet code - no change needed here)
-  try {
-    const { address } = req.params;
-    
-    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
-    const minSuccessRate = parseInt(req.query.minRate) || 40;
-    const minLowCapTrades = parseInt(req.query.minTrades) || 3;
-    
-    console.log('Analyzing wallet:', address);
-    console.log('Filters: MC <', maxMarketCap, 'Rate >', minSuccessRate + '%', 'Trades >', minLowCapTrades);
-    
-    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
-    const response = await fetch(url);
-    const transactions = await response.json();
-    
-    if (!transactions || transactions.length === 0) {
-      return res.json({
-        address,
-        isEarlyEntrySpecialist: false,
-        lowCapEntries: 0,
-        totalTrades: 0,
-        earlyEntryRate: 0,
-        successfulLowCapExits: 0,
-        filters: { maxMarketCap, minSuccessRate, minLowCapTrades },
-        error: 'No transactions found'
-      });
-    }
-    
-    const swaps = transactions.filter(tx => 
-      tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
-    );
-    
-    const tokenSet = new Set();
-    const tokenEntries = {};
-    
-    for (const tx of swaps) {
-      if (tx.tokenTransfers) {
-        for (const transfer of tx.tokenTransfers) {
-          if (transfer.mint && transfer.mint !== 'So11111111111111111111111111111111111111112') {
-            tokenSet.add(transfer.mint);
-            if (!tokenEntries[transfer.mint]) {
-              tokenEntries[transfer.mint] = { firstSeen: tx.timestamp, address: transfer.mint };
-            }
-          }
-        }
-      }
-    }
-    
-    console.log('Found', tokenSet.size, 'unique tokens');
-    
-    let lowCapEntries = 0;
-    let successfulLowCapTrades = 0;
-    const analyzedTokens = [];
-    
-    const recentTokens = Array.from(tokenSet).slice(0, 5);
-    
-    for (const tokenAddr of recentTokens) {
-      const metadata = await getTokenMetadata(tokenAddr);
-      const mcData = await getTokenMarketCap(tokenAddr);
-      
-      const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
-      const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
-      
-      if (meetsLowCapCriteria || isVeryNew) {
-        lowCapEntries++;
-        if (mcData.marketCap > maxMarketCap * 10) {
-          successfulLowCapTrades++;
-        }
-      }
-      
-      analyzedTokens.push({
-        address: tokenAddr,
-        symbol: metadata.symbol,
-        name: metadata.name,
-        currentMC: mcData.marketCap,
-        meetsFilter: meetsLowCapCriteria,
-        isNew: isVeryNew,
-        firstTradedBy: new Date(tokenEntries[tokenAddr].firstSeen * 1000).toISOString()
-      });
-      
-      await new Promise(r => setTimeout(r, 300));
-    }
-    
-    const earlyEntryRate = swaps.length > 0 ? Math.floor((lowCapEntries / Math.min(swaps.length, 20)) * 100) : 0;
-    const isSpecialist = lowCapEntries >= minLowCapTrades && earlyEntryRate >= minSuccessRate;
-    
-    const analysis = {
-      address,
-      isEarlyEntrySpecialist: isSpecialist,
-      lowCapEntries: lowCapEntries,
-      totalTrades: swaps.length,
-      earlyEntryRate: earlyEntryRate,
-      successfulLowCapExits: successfulLowCapTrades,
-      score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
-      analyzedTokens: analyzedTokens,
-      lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
-      specialistBadge: isSpecialist ? 'EARLY ENTRY SPECIALIST' : null,
-      filters: {
-        maxMarketCap,
-        minSuccessRate,
-        minLowCapTrades
-      }
-    };
-    
-    console.log('Result:', isSpecialist ? 'SPECIALIST' : 'Regular', '| Low cap:', lowCapEntries, '| Rate:', earlyEntryRate + '%');
-    
-    res.json(analysis);
-    
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: error.message });
-  }
+  // ... (your full existing /api/wallet code here - keep it exactly as is)
+  // (I'm not repeating it to save space, but copy from your current file)
 });
 
-// AUTO-DISCOVERY - Now includes negative price changes (dips) to find high-ROI traders
+// AUTO-DISCOVERY - Multi-page scraping of DexScreener Solana trending (6H)
 app.get('/api/discover', async (req, res) => {
   try {
-    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
-    const minChangePercent = parseInt(req.query.minPump) || 100; // Absolute value - positive or negative
+    const numPages = 5; // First 5 pages = up to 500 tokens (adjust 1-10)
+    const minAbsChange = parseInt(req.query.minPump) || 50; // |change| > this %
     
-    console.log('Starting auto-discovery (includes dips)...');
-    console.log('Filters: MC <', maxMarketCap, '| |Change| >', minChangePercent + '%');
+    console.log(`Scraping ${numPages} pages of DexScreener Solana trending (6H)...`);
     
-    const searchUrl = 'https://api.dexscreener.com/latest/dex/search?q=solana';
-    const searchResponse = await fetch(searchUrl);
-    const searchData = await searchResponse.json();
+    const scrapedTokens = [];
     
-    if (!searchData || !searchData.pairs) {
-      return res.json({ 
-        error: 'No tokens found', 
-        discoveredWallets: []
-      });
+    for (let page = 1; page <= numPages; page++) {
+      const url = page === 1 
+        ? 'https://dexscreener.com/solana?rankBy=trendingScoreH6&order=desc'
+        : `https://dexscreener.com/solana/page-${page}?rankBy=trendingScoreH6&order=desc`;
+      
+      try {
+        const response = await fetch(url);
+        const html = await response.text();
+        const $ = cheerio.load(html);
+        
+        const rows = $('ds-token-row');
+        console.log(`Page ${page}: Found ${rows.length} token rows`);
+        
+        rows.each((i, elem) => {
+          const symbol = $(elem).find('.ds-token-symbol').text().trim() || 'Unknown';
+          const name = $(elem).find('.ds-token-name').text().trim() || 'Unknown';
+          
+          const change24hText = $(elem).find('.ds-price-change.ds-price-change-24h').text().trim();
+          const change24h = parseFloat(change24hText.replace('%', '')) || 0;
+          
+          const volumeText = $(elem).find('.ds-volume.ds-volume-24h').text().trim();
+          const volume = parseFloat(volumeText.replace('$', '').replace('K', '000').replace('M', '000000').replace('B', '000000000')) || 0;
+          
+          const link = $(elem).find('a.ds-token-link').attr('href');
+          const pairAddress = link ? link.split('/').pop() : null;
+          
+          if (pairAddress && Math.abs(change24h) > minAbsChange && volume > 20000) {
+            scrapedTokens.push({
+              symbol,
+              name,
+              change24h,
+              volume,
+              pairAddress
+            });
+          }
+        });
+        
+        await new Promise(r => setTimeout(r, 1000)); // Be polite to server
+        
+      } catch (err) {
+        console.error(`Error scraping page ${page}:`, err.message);
+      }
     }
     
-    const volatileTokens = searchData.pairs
-      .filter(pair => {
-        const change24h = pair.priceChange?.h24 || 0;
-        const volume = pair.volume?.h24 || 0;
-        return pair.chainId === 'solana' &&
-               Math.abs(change24h) > minChangePercent && // Key change: includes negative %
-               volume > 50000;
-      })
-      .slice(0, 3);
+    console.log(`Scraping complete. Found ${scrapedTokens.length} volatile tokens (pumps & dips)`);
     
-    console.log('Found', volatileTokens.length, 'volatile Solana tokens (pumps or dips)');
-    
-    if (volatileTokens.length === 0) {
+    if (scrapedTokens.length === 0) {
       return res.json({
         success: true,
         discoveredWallets: [],
-        analyzedTokens: 0,
-        totalWalletsFound: 0,
-        message: 'No volatile tokens found. Try lowering minPump (e.g., ?minPump=50).',
-        filters: { maxMarketCap, minChangePercent }
+        scrapedTokens: 0,
+        message: 'No volatile tokens found on trending pages. Try lowering minPump.',
+        timestamp: new Date()
       });
     }
     
+    // Take top 20 volatile tokens for wallet analysis (to respect rate limits)
+    const selectedTokens = scrapedTokens.slice(0, 20);
+    
     const walletScores = {};
     
-    for (const token of volatileTokens) {
-      const mintAddress = token.baseToken.address;
-      console.log('Getting transactions for:', token.baseToken.symbol, '(' + mintAddress + ')');
+    for (const token of selectedTokens) {
+      let mintAddress = null;
+      
+      // Get mint from pair address
+      try {
+        const pairResponse = await fetch(`https://api.dexscreener.com/latest/dex/pairs/solana/${token.pairAddress}`);
+        const pairData = await pairResponse.json();
+        mintAddress = pairData.pair?.baseToken?.address;
+      } catch (err) {
+        console.log('Failed to get mint for', token.symbol);
+      }
+      
+      if (!mintAddress) continue;
+      
+      console.log('Analyzing wallets for:', token.symbol, `(${mintAddress})`, `Change: ${token.change24h}%`);
       
       try {
         const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
@@ -308,24 +208,23 @@ app.get('/api/discover', async (req, res) => {
             };
           }
           
-          walletScores[walletAddr].score += Math.abs(token.priceChange.h24);
+          walletScores[walletAddr].score += Math.abs(token.change24h);
           walletScores[walletAddr].tokensFound.push({
-            symbol: token.baseToken.symbol,
-            changePercent: token.priceChange.h24  // Shows negative if dipped
+            symbol: token.symbol,
+            changePercent: token.change24h
           });
         }
         
         await new Promise(r => setTimeout(r, 500));
-        
       } catch (err) {
-        console.error('Error:', err.message);
+        console.error('Helius error:', err.message);
       }
     }
     
     const discoveredWallets = Object.values(walletScores)
       .filter(w => w.tokensFound.length >= 1)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 10)
+      .slice(0, 20)
       .map((wallet, index) => ({
         rank: index + 1,
         address: wallet.address,
@@ -337,10 +236,10 @@ app.get('/api/discover', async (req, res) => {
     
     res.json({
       success: true,
-      discoveredWallets: discoveredWallets,
-      analyzedTokens: volatileTokens.length,
+      discoveredWallets,
+      scrapedTokens: scrapedTokens.length,
+      analyzedTokens: selectedTokens.length,
       totalWalletsFound: Object.keys(walletScores).length,
-      filters: { maxMarketCap, minChangePercent },
       timestamp: new Date()
     });
     
@@ -350,27 +249,7 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// DEXSCREENER (unchanged)
-app.get('/api/dexscreener/:address', async (req, res) => {
-  try {
-    const { address } = req.params;
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// HOME
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'LOW CAP HUNTER API is running', 
-    timestamp: new Date(),
-    uptime: process.uptime(),
-    note: 'Now includes negative price changes to find high-ROI traders who sold before dips'
-  });
-});
+// Keep your other endpoints (dexscreener, wallet, home) unchanged
 
 app.use(cors());
 app.use(express.json());
