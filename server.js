@@ -12,7 +12,6 @@ const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
 
-// Load token registry
 async function loadTokenRegistry() {
   try {
     const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
@@ -20,13 +19,12 @@ async function loadTokenRegistry() {
     data.tokens.forEach(token => {
       tokenCache[token.address] = { symbol: token.symbol, name: token.name };
     });
-    console.log(`✅ Loaded ${Object.keys(tokenCache).length} tokens from registry`);
+    console.log('Loaded', Object.keys(tokenCache).length, 'tokens from registry');
   } catch (err) {
     console.error('Failed to load token registry:', err.message);
   }
 }
 
-// Get token metadata
 async function getTokenMetadata(address) {
   if (tokenCache[address]) return tokenCache[address];
   
@@ -64,7 +62,6 @@ async function getTokenMetadata(address) {
   return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
 }
 
-// Get current market cap from DexScreener
 async function getTokenMarketCap(address) {
   try {
     const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
@@ -85,18 +82,16 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
 }
 
-// Analyze wallet with CUSTOMIZABLE market cap filter
 app.get('/api/wallet/:address', async (req, res) => {
   try {
     const { address } = req.params;
     
-    // Get filter settings from query params (with defaults)
-    const maxMarketCap = parseInt(req.query.maxMC) || 1000000; // Default $1M
-    const minSuccessRate = parseInt(req.query.minRate) || 40; // Default 40%
-    const minLowCapTrades = parseInt(req.query.minTrades) || 3; // Default 3 trades
+    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
+    const minSuccessRate = parseInt(req.query.minRate) || 40;
+    const minLowCapTrades = parseInt(req.query.minTrades) || 3;
     
-    console.log(`🔍 Analyzing wallet: ${address}`);
-    console.log(⚙️ Filters: MC < $${maxMarketCap.toLocaleString()}, Success Rate > ${minSuccessRate}%, Min Trades > ${minLowCapTrades}`);
+    console.log('Analyzing wallet:', address);
+    console.log('Filters: MC <', maxMarketCap, 'Rate >', minSuccessRate + '%', 'Trades >', minLowCapTrades);
     
     const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
     const response = await fetch(url);
@@ -119,7 +114,6 @@ app.get('/api/wallet/:address', async (req, res) => {
       tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
     );
     
-    // Extract tokens
     const tokenSet = new Set();
     const tokenEntries = {};
     
@@ -136,7 +130,7 @@ app.get('/api/wallet/:address', async (req, res) => {
       }
     }
     
-    console.log(`📊 Found ${tokenSet.size} unique tokens`);
+    console.log('Found', tokenSet.size, 'unique tokens');
     
     let lowCapEntries = 0;
     let successfulLowCapTrades = 0;
@@ -148,13 +142,11 @@ app.get('/api/wallet/:address', async (req, res) => {
       const metadata = await getTokenMetadata(tokenAddr);
       const mcData = await getTokenMarketCap(tokenAddr);
       
-      // Check if meets LOW CAP criteria based on user's filter
       const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
       const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
       
       if (meetsLowCapCriteria || isVeryNew) {
         lowCapEntries++;
-        // Check if it pumped after they bought (10x from filter threshold)
         if (mcData.marketCap > maxMarketCap * 10) {
           successfulLowCapTrades++;
         }
@@ -186,7 +178,7 @@ app.get('/api/wallet/:address', async (req, res) => {
       score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
       analyzedTokens: analyzedTokens,
       lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
-      specialistBadge: isSpecialist ? '🎯 EARLY ENTRY SPECIALIST' : null,
+      specialistBadge: isSpecialist ? 'EARLY ENTRY SPECIALIST' : null,
       filters: {
         maxMarketCap,
         minSuccessRate,
@@ -194,17 +186,43 @@ app.get('/api/wallet/:address', async (req, res) => {
       }
     };
     
-    console.log(`✅ Result: ${isSpecialist ? 'SPECIALIST' : 'Regular'} | Low cap: ${lowCapEntries} | Rate: ${earlyEntryRate}%`);
+    console.log('Result:', isSpecialist ? 'SPECIALIST' : 'Regular', '| Low cap:', lowCapEntries, '| Rate:', earlyEntryRate + '%');
     
     res.json(analysis);
     
   } catch (error) {
-    console.error('❌ Error:', error);
+    console.error('Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// DexScreener endpoint
 app.get('/api/dexscreener/:address', async (req, res) => {
   try {
-    const { ad
+    const { address } = req.params;
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'LOW CAP HUNTER API - Customizable Filters',
+    defaultFilters: {
+      maxMarketCap: '$1,000,000',
+      minSuccessRate: '40%',
+      minLowCapTrades: 3
+    },
+    usage: '/api/wallet/{address}?maxMC=1000000&minRate=40&minTrades=3',
+    timestamp: new Date() 
+  });
+});
+
+loadTokenRegistry();
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('LOW CAP HUNTER API running on port', PORT);
+  console.log('Customizable filters: Market Cap, Success Rate, Min Trades');
+});
