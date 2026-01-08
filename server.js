@@ -5,10 +5,10 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Your Birdeye key (free tier)
+// Birdeye key
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
 
-// Your Helius key
+// Helius key
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
@@ -87,7 +87,7 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, age: null };
 }
 
-// ANALYZE WALLET (unchanged)
+// ANALYZE WALLET
 app.get('/api/wallet/:address', async (req, res) => {
   try {
     const { address } = req.params;
@@ -197,14 +197,14 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// MAIN DISCOVERY - Merged DexScreener New Pairs + Birdeye List with Success Scoring
+// MAIN DISCOVERY - Merged with Fixed Birdeye Variable
 app.get('/api/discover', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50; // Adjustable limit (default 50 for more data)
+    const limit = parseInt(req.query.limit) || 50;
     
     const walletScores = {};
     
-    // 1. DexScreener New Pairs (fresh launches - high early ROI)
+    // DexScreener New Pairs
     console.log('Fetching new pairs from DexScreener...');
     const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
     const newResponse = await fetch(newPairsUrl);
@@ -254,7 +254,7 @@ app.get('/api/discover', async (req, res) => {
       } catch (err) {}
     }
     
-    // 2. Birdeye Token List (larger established/trending tokens)
+    // Birdeye Token List
     console.log('Fetching token list from Birdeye...');
     const birdeyeUrl = `https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=desc&offset=0&limit=${limit}`;
     const birdeyeResponse = await fetch(birdeyeUrl, {
@@ -264,50 +264,51 @@ app.get('/api/discover', async (req, res) => {
       }
     });
     
+    let birdeyeTokens = [];
     if (birdeyeResponse.ok) {
       const birdeyeData = await birdeyeResponse.json();
-      const birdeyeTokens = (birdeyeData.data?.tokens || []).slice(0, limit);
-      
-      for (const token of birdeyeTokens) {
-        const mintAddress = token.address;
-        
-        try {
-          const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-          const txResponse = await fetch(txUrl);
-          const transactions = await txResponse.json();
-          
-          if (!transactions || transactions.length === 0) continue;
-          
-          const wallets = new Set();
-          for (const tx of transactions) {
-            if (tx.tokenTransfers) {
-              for (const transfer of tx.tokenTransfers) {
-                if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
-                if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
-              }
-            }
-          }
-          
-          for (const wallet of wallets) {
-            if (!walletScores[wallet]) {
-              walletScores[wallet] = {
-                address: wallet,
-                earlyBuys: 0,
-                totalTokens: 0,
-                totalChangeBonus: 0,
-                score: 0
-              };
-            }
-            walletScores[wallet].totalTokens += 1;
-            walletScores[wallet].totalChangeBonus += (token.priceChange?.h24 || 0 > 0 ? token.priceChange?.h24 || 0 : 0);
-          }
-          
-          await new Promise(r => setTimeout(r, 500));
-        } catch (err) {}
-      }
+      birdeyeTokens = (birdeyeData.data?.tokens || []).slice(0, limit);
     }
     
-    // Calculate final success score
+    for (const token of birdeyeTokens) {
+      const mintAddress = token.address;
+      
+      try {
+        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+        const txResponse = await fetch(txUrl);
+        const transactions = await txResponse.json();
+        
+        if (!transactions || transactions.length === 0) continue;
+        
+        const wallets = new Set();
+        for (const tx of transactions) {
+          if (tx.tokenTransfers) {
+            for (const transfer of tx.tokenTransfers) {
+              if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
+              if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+            }
+          }
+        }
+        
+        for (const wallet of wallets) {
+          if (!walletScores[wallet]) {
+            walletScores[wallet] = {
+              address: wallet,
+              earlyBuys: 0,
+              totalTokens: 0,
+              totalChangeBonus: 0,
+              score: 0
+            };
+          }
+          walletScores[wallet].totalTokens += 1;
+          walletScores[wallet].totalChangeBonus += (token.priceChange?.h24 || 0 > 0 ? token.priceChange?.h24 || 0 : 0);
+        }
+        
+        await new Promise(r => setTimeout(r, 500));
+      } catch (err) {}
+    }
+    
+    // Calculate final score
     Object.values(walletScores).forEach(w => {
       w.score = (w.earlyBuys * 10) + w.totalTokens + Math.floor(w.totalChangeBonus);
     });
@@ -328,9 +329,9 @@ app.get('/api/discover', async (req, res) => {
       success: true,
       discoveredWallets,
       totalWallets: Object.keys(walletScores).length,
-      tokensAnalyzed: newTokens.length + (birdeyeResponse.ok ? (birdeyeData.data?.tokens || []).length : 0),
+      tokensAnalyzed: newTokens.length + birdeyeTokens.length,
       limitUsed: limit,
-      message: 'Merged new pairs + Birdeye list with success scoring. Refresh anytime for fresh data!',
+      message: 'Merged new pairs + Birdeye list with success scoring!',
       timestamp: new Date()
     });
     
@@ -352,7 +353,7 @@ app.get('/api/dexscreener/:address', async (req, res) => {
   }
 });
 
-// HOME - Fixed with useful info
+// HOME
 app.get('/', (req, res) => {
   res.json({
     status: 'Memecoin Tracker Backend is LIVE!',
