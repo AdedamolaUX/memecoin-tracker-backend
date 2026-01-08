@@ -85,7 +85,7 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
 }
 
-// Helper functions
+// Helper functions (kept for backward compatibility but not used in discovery)
 function generateSolanaAddress() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789';
   let result = '';
@@ -229,15 +229,17 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// AUTO-DISCOVERY
+// AUTO-DISCOVERY - FIXED VERSION WITH REAL WALLET ADDRESSES
 app.get('/api/discover', async (req, res) => {
   try {
     const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
     const minPumpPercent = parseInt(req.query.minPump) || 100;
+    const limit = parseInt(req.query.limit) || 10; // How many wallets to return
     
-    console.log('Starting auto-discovery...');
+    console.log('Starting REAL auto-discovery...');
     console.log('Filters: MC <', maxMarketCap, '| Pump >', minPumpPercent + '%');
     
+    // Step 1: Find tokens that recently pumped
     const searchUrl = 'https://api.dexscreener.com/latest/dex/search?q=solana';
     const searchResponse = await fetch(searchUrl);
     const searchData = await searchResponse.json();
@@ -255,32 +257,110 @@ app.get('/api/discover', async (req, res) => {
         const volume = pair.volume?.h24 || 0;
         return change24h > minPumpPercent && volume > 50000;
       })
-      .slice(0, 5);
+      .slice(0, 3); // Analyze top 3 pumped tokens
     
     console.log('Found', pumpedTokens.length, 'pumped tokens');
     
-    const discoveredWallets = [];
+    // Step 2: For each token, get REAL early buyer wallets
+    const walletScores = {}; // Track wallets across multiple tokens
     
-    // Simulate finding wallets for each token
     for (const token of pumpedTokens) {
-      for (let i = 0; i < 3; i++) {
-        discoveredWallets.push({
-          address: generateSolanaAddress(),
-          name: generateWalletName(),
-          discoveredFrom: token.baseToken.symbol,
-          pumpPercent: token.priceChange.h24,
-          score: Math.floor(50 + Math.random() * 50),
-          discoveredAt: new Date().toISOString()
-        });
+      const mintAddress = token.baseToken.address;
+      console.log('Analyzing token:', token.baseToken.symbol, mintAddress);
+      
+      try {
+        // Get token's transaction signatures
+        const sigUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+        const sigResponse = await fetch(sigUrl);
+        const transactions = await sigResponse.json();
+        
+        if (!transactions || transactions.length === 0) {
+          console.log('No transactions found for', token.baseToken.symbol);
+          continue;
+        }
+        
+        console.log('Found', transactions.length, 'transactions for', token.baseToken.symbol);
+        
+        // Step 3: Extract buyer wallets from transactions
+        const buyers = new Set();
+        
+        for (const tx of transactions) {
+          // Look for swap transactions
+          if (tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)) {
+            
+            // Find wallets that received this token (buyers)
+            if (tx.tokenTransfers) {
+              for (const transfer of tx.tokenTransfers) {
+                if (transfer.mint === mintAddress && 
+                    transfer.toUserAccount && 
+                    transfer.toUserAccount !== mintAddress) {
+                  buyers.add(transfer.toUserAccount);
+                }
+              }
+            }
+            
+            // Also check account data
+            if (tx.accountData) {
+              for (const account of tx.accountData) {
+                if (account.account && account.account !== mintAddress) {
+                  buyers.add(account.account);
+                }
+              }
+            }
+          }
+        }
+        
+        console.log('Found', buyers.size, 'unique buyers for', token.baseToken.symbol);
+        
+        // Step 4: Score these wallets
+        for (const walletAddr of buyers) {
+          if (!walletScores[walletAddr]) {
+            walletScores[walletAddr] = {
+              address: walletAddr,
+              tokensFound: [],
+              score: 0
+            };
+          }
+          
+          // Add points for finding wallet in a pumped token
+          walletScores[walletAddr].score += Math.floor(token.priceChange.h24);
+          walletScores[walletAddr].tokensFound.push({
+            symbol: token.baseToken.symbol,
+            pumpPercent: token.priceChange.h24,
+            volume: token.volume.h24
+          });
+        }
+        
+        // Rate limiting
+        await new Promise(r => setTimeout(r, 500));
+        
+      } catch (err) {
+        console.error('Error analyzing token', token.baseToken.symbol, ':', err.message);
       }
     }
     
-    console.log('Discovery complete. Found', discoveredWallets.length, 'wallets');
+    // Step 5: Rank wallets by score and return top performers
+    const rankedWallets = Object.values(walletScores)
+      .filter(w => w.tokensFound.length >= 1) // Must have traded at least 1 pumped token
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map((wallet, index) => ({
+        rank: index + 1,
+        address: wallet.address,
+        score: wallet.score,
+        tokensFound: wallet.tokensFound,
+        discoveredFrom: wallet.tokensFound.map(t => t.symbol).join(', '),
+        avgPump: Math.floor(wallet.tokensFound.reduce((sum, t) => sum + t.pumpPercent, 0) / wallet.tokensFound.length),
+        discoveredAt: new Date().toISOString()
+      }));
+    
+    console.log('Discovery complete. Found', rankedWallets.length, 'REAL wallets');
     
     res.json({
       success: true,
-      discoveredWallets: discoveredWallets,
+      discoveredWallets: rankedWallets,
       analyzedTokens: pumpedTokens.length,
+      totalWalletsScanned: Object.keys(walletScores).length,
       filters: { maxMarketCap, minPumpPercent },
       timestamp: new Date()
     });
@@ -306,10 +386,10 @@ app.get('/api/dexscreener/:address', async (req, res) => {
 // HOME
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'LOW CAP HUNTER API - Customizable Filters',
+    status: 'LOW CAP HUNTER API - REAL Wallet Discovery',
     endpoints: {
       wallet: '/api/wallet/:address?maxMC=1000000&minRate=40&minTrades=3',
-      discover: '/api/discover?maxMC=1000000&minPump=100',
+      discover: '/api/discover?maxMC=1000000&minPump=100&limit=10',
       dexscreener: '/api/dexscreener/:address'
     },
     timestamp: new Date() 
