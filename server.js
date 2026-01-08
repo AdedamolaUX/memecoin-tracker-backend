@@ -40,7 +40,7 @@ async function getTokenMetadata(address) {
     return tokenCache[address];
   }
   
-  // Try Helius API
+  // Try Helius API first
   try {
     const url = `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`;
     const response = await fetch(url, {
@@ -50,13 +50,11 @@ async function getTokenMetadata(address) {
     });
     
     const data = await response.json();
-    if (data && data[0]) {
+    if (data && data[0] && data[0].symbol && data[0].symbol !== 'UNKNOWN') {
       const metadata = {
-        symbol: data[0].symbol || 'UNKNOWN',
-        name: data[0].name || 'Unknown Token'
+        symbol: data[0].symbol,
+        name: data[0].name || data[0].symbol
       };
-      
-      // Cache it
       tokenCache[address] = metadata;
       return metadata;
     }
@@ -64,7 +62,26 @@ async function getTokenMetadata(address) {
     console.log('Helius metadata fetch failed:', err.message);
   }
   
-  // Fallback: return shortened address
+  // Try DexScreener as fallback for new tokens
+  try {
+    const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
+    const dexResponse = await fetch(dexUrl);
+    const dexData = await dexResponse.json();
+    
+    if (dexData && dexData.pairs && dexData.pairs[0]) {
+      const pair = dexData.pairs[0];
+      const metadata = {
+        symbol: pair.baseToken.symbol || 'UNKNOWN',
+        name: pair.baseToken.name || 'Unknown Token'
+      };
+      tokenCache[address] = metadata;
+      return metadata;
+    }
+  } catch (err) {
+    console.log('DexScreener metadata fetch failed:', err.message);
+  }
+  
+  // Final fallback: return shortened address
   return {
     symbol: address.slice(0, 4) + '...' + address.slice(-4),
     name: 'Unknown Token'
