@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memecoin Dev Tracker</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Simple icon components
+        const Icon = ({ d, className }) => (
+            <svg className={className} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={d} />
+            </svg>
+        );
+
+        function App() {
+            const [apiStatus, setApiStatus] = useState({
+                dexscreener: 'checking',
+                solscan: 'checking',
+                jupiter: 'checking',
+                solanaRpc: 'checking'
+            });
+            const [showStatus, setShowStatus] = useState(true);
+            const [wallets, setWallets] = useState([]);
+            const [launches, setLaunches] = useState([]);
+            const [tokenDetails, setTokenDetails] = useState({});
+            const [newWallet, setNewWallet] = useState({ address: '', nickname: '', chain: 'solana' });
+
+            const API_ENDPOINTS = {
+                dexscreener: 'https://api.dexscreener.com/latest/dex',
+                solscan: 'https://public-api.solscan.io',
+                jupiter: 'https://quote-api.jup.ag/v6',
+                solanaRpc: 'https://api.mainnet-beta.solana.com'
+            };
+
+            useEffect(() => {
+                checkApiStatus();
+                loadData();
+            }, []);
+
+            const loadData = () => {
+                const saved = localStorage.getItem('wallets');
+                if (saved) setWallets(JSON.parse(saved));
+                const savedLaunches = localStorage.getItem('launches');
+                if (savedLaunches) setLaunches(JSON.parse(savedLaunches));
+            };
+
+            const checkApiStatus = async () => {
+                console.log('🔍 Checking API status...');
+
+                // DEXScreener
+                try {
+                    const res = await fetch(`${API_ENDPOINTS.dexscreener}/tokens/So11111111111111111111111111111111111111112`);
+                    setApiStatus(prev => ({ ...prev, dexscreener: res.ok ? 'online' : 'offline' }));
+                    console.log('DEXScreener:', res.ok ? '✅ ONLINE' : '❌ OFFLINE');
+                } catch (e) {
+                    setApiStatus(prev => ({ ...prev, dexscreener: 'offline' }));
+                    console.log('DEXScreener: ❌ OFFLINE', e.message);
+                }
+
+                // Solscan
+                try {
+                    const res = await fetch(`${API_ENDPOINTS.solscan}/account/transactions?account=So11111111111111111111111111111111111111112&limit=1`);
+                    setApiStatus(prev => ({ ...prev, solscan: res.ok ? 'online' : 'offline' }));
+                    console.log('Solscan:', res.ok ? '✅ ONLINE' : '❌ OFFLINE');
+                } catch (e) {
+                    setApiStatus(prev => ({ ...prev, solscan: 'offline' }));
