@@ -5,12 +5,11 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImEyMjUyZTcwLWQ1NGYtNDc2Zi04NzdlLTA1YmMzZjZkOGNmNSIsIm9yZ0lkIjoiNDg5MjY0IiwidXNlcklkIjoiNTAzMzkzIiwidHlwZUlkIjoiNTM5NmE0NmMtOGE3OC00NWI1LThlOWMtZDY0OTA4YmJjMWU2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc4NjI4NjMsImV4cCI6NDkyMzYyMjg2M30.YK8NJCVztDL39VYA1fMwyCL__3_lidUSFKbYFK8qcSQ'; // Your key for Moralis Pump.fun APIs
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
 
-// Load token registry (unchanged)
+// Load token registry
 async function loadTokenRegistry() {
   try {
     const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
@@ -24,7 +23,7 @@ async function loadTokenRegistry() {
   }
 }
 
-// Get token metadata (unchanged)
+// Get token metadata
 async function getTokenMetadata(address) {
   if (tokenCache[address]) return tokenCache[address];
   
@@ -49,7 +48,7 @@ async function getTokenMetadata(address) {
     const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
     const dexResponse = await fetch(dexUrl);
     const dexData = await dexResponse.json();
-    if (dexData && data.pairs && dexData.pairs[0]) {
+    if (dexData && dexData.pairs && dexData.pairs[0]) {
       const pair = dexData.pairs[0];
       const metadata = { symbol: pair.baseToken.symbol, name: pair.baseToken.name };
       tokenCache[address] = metadata;
@@ -62,7 +61,7 @@ async function getTokenMetadata(address) {
   return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
 }
 
-// Get market cap (unchanged)
+// Get market cap
 async function getTokenMarketCap(address) {
   try {
     const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
@@ -83,11 +82,11 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, liquidity: 0, age: null };
 }
 
-// Helper functions (unchanged)
+// Helper functions
 function generateSolanaAddress() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789';
   let result = '';
-  for (let i = 0; i < 44; i++) {
+  for (let i = 0; i = 44; i++) {
     result += chars[Math.floor(Math.random() * chars.length)];
   }
   return result;
@@ -114,6 +113,7 @@ function findCommonTokensInWallets(wallets) {
 
 // ANALYZE WALLET (unchanged)
 app.get('/api/wallet/:address', async (req, res) => {
+  // ... (your existing /api/wallet code - no change needed here)
   try {
     const { address } = req.params;
     
@@ -227,16 +227,15 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// AUTO-DISCOVERY WITH SOLANA CHAIN FILTER
+// AUTO-DISCOVERY - Now includes negative price changes (dips) to find high-ROI traders
 app.get('/api/discover', async (req, res) => {
   try {
     const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
-    const minPumpPercent = parseInt(req.query.minPump) || 100;
+    const minChangePercent = parseInt(req.query.minPump) || 100; // Absolute value - positive or negative
     
-    console.log('Starting REAL auto-discovery...');
-    console.log('Filters: MC <', maxMarketCap, '| Pump >', minPumpPercent + '%');
+    console.log('Starting auto-discovery (includes dips)...');
+    console.log('Filters: MC <', maxMarketCap, '| |Change| >', minChangePercent + '%');
     
-    // Step 1: Find pumped tokens ON SOLANA CHAIN
     const searchUrl = 'https://api.dexscreener.com/latest/dex/search?q=solana';
     const searchResponse = await fetch(searchUrl);
     const searchData = await searchResponse.json();
@@ -248,63 +247,51 @@ app.get('/api/discover', async (req, res) => {
       });
     }
     
-    const pumpedTokens = searchData.pairs
+    const volatileTokens = searchData.pairs
       .filter(pair => {
         const change24h = pair.priceChange?.h24 || 0;
         const volume = pair.volume?.h24 || 0;
-        // CRITICAL FIX: Only get actual Solana chain tokens
         return pair.chainId === 'solana' &&
-               change24h > minPumpPercent && 
+               Math.abs(change24h) > minChangePercent && // Key change: includes negative %
                volume > 50000;
       })
-      .slice(0, 3); // Top 3 pumped tokens
+      .slice(0, 3);
     
-    console.log('Found', pumpedTokens.length, 'pumped Solana tokens');
+    console.log('Found', volatileTokens.length, 'volatile Solana tokens (pumps or dips)');
     
-    if (pumpedTokens.length === 0) {
+    if (volatileTokens.length === 0) {
       return res.json({
         success: true,
         discoveredWallets: [],
         analyzedTokens: 0,
         totalWalletsFound: 0,
-        message: 'No Solana tokens found matching criteria. Try lowering minPump parameter.',
-        filters: { maxMarketCap, minPumpPercent }
+        message: 'No volatile tokens found. Try lowering minPump (e.g., ?minPump=50).',
+        filters: { maxMarketCap, minChangePercent }
       });
     }
     
-    // Step 2: Get REAL wallet addresses from token transactions
     const walletScores = {};
     
-    for (const token of pumpedTokens) {
+    for (const token of volatileTokens) {
       const mintAddress = token.baseToken.address;
       console.log('Getting transactions for:', token.baseToken.symbol, '(' + mintAddress + ')');
       
       try {
-        // Get transactions for this token
         const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
         const txResponse = await fetch(txUrl);
         const transactions = await txResponse.json();
         
-        if (!transactions || transactions.length === 0) {
-          console.log('No transactions for', token.baseToken.symbol);
-          continue;
-        }
+        if (!transactions || transactions.length === 0) continue;
         
-        console.log('Found', transactions.length, 'transactions for', token.baseToken.symbol);
-        
-        // Extract wallet addresses from transactions
         const wallets = new Set();
         
         for (const tx of transactions) {
-          // Get wallets from token transfers
           if (tx.tokenTransfers) {
             for (const transfer of tx.tokenTransfers) {
               if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
               if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
             }
           }
-          
-          // Get wallets from account data
           if (tx.accountData) {
             for (const account of tx.accountData) {
               if (account.account) wallets.add(account.account);
@@ -312,9 +299,6 @@ app.get('/api/discover', async (req, res) => {
           }
         }
         
-        console.log('Found', wallets.size, 'unique wallets for', token.baseToken.symbol);
-        
-        // Score these wallets
         for (const walletAddr of wallets) {
           if (!walletScores[walletAddr]) {
             walletScores[walletAddr] = {
@@ -327,18 +311,17 @@ app.get('/api/discover', async (req, res) => {
           walletScores[walletAddr].score += Math.abs(token.priceChange.h24);
           walletScores[walletAddr].tokensFound.push({
             symbol: token.baseToken.symbol,
-            pumpPercent: token.priceChange.h24
+            changePercent: token.priceChange.h24  // Shows negative if dipped
           });
         }
         
-        await new Promise(r => setTimeout(r, 500)); // Rate limit
+        await new Promise(r => setTimeout(r, 500));
         
       } catch (err) {
-        console.error('Error getting transactions for', token.baseToken.symbol, ':', err.message);
+        console.error('Error:', err.message);
       }
     }
     
-    // Step 3: Rank and return top wallets
     const discoveredWallets = Object.values(walletScores)
       .filter(w => w.tokensFound.length >= 1)
       .sort((a, b) => b.score - a.score)
@@ -352,193 +335,17 @@ app.get('/api/discover', async (req, res) => {
         discoveredAt: new Date().toISOString()
       }));
     
-    console.log('Discovery complete. Found', discoveredWallets.length, 'REAL wallets');
-    
     res.json({
       success: true,
       discoveredWallets: discoveredWallets,
-      analyzedTokens: pumpedTokens.length,
+      analyzedTokens: volatileTokens.length,
       totalWalletsFound: Object.keys(walletScores).length,
-      filters: { maxMarketCap, minPumpPercent },
+      filters: { maxMarketCap, minChangePercent },
       timestamp: new Date()
     });
     
   } catch (error) {
     console.error('Discovery error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// NEW ENDPOINT: PUMPFUN TRACKING (new pairs -> graduation -> high MC -> early wallets -> next moves)
-app.get('/api/pumpfun/track', async (req, res) => {
-  try {
-    const minMC = parseInt(req.query.minMC) || 1000000; // Min market cap for high-growth tokens (e.g., $1M+)
-
-    console.log('Starting Pump.fun tracking...');
-    console.log('Filter: Graduated tokens MC >', minMC);
-
-    // Step 1: Get new Pump.fun tokens (from Moralis free API)
-    const newTokensUrl = 'https://solana-gateway.moralis.io/token/mainnet/exchange/pumpfun/new?limit=20'; // Top 20 new launches
-    const newResponse = await fetch(newTokensUrl, {
-      headers: { 'X-API-Key': MORALIS_API_KEY }
-    });
-    const newTokens = await newResponse.json();
-
-    if (!newTokens || newTokens.length === 0) {
-      return res.json({ error: 'No new Pump.fun tokens found', graduatedTokens: [], successfulWallets: [] });
-    }
-
-    console.log('Found', newTokens.length, 'new Pump.fun tokens');
-
-    // Step 2: Filter graduated tokens and check high MC
-    const graduatedTokens = [];
-    for (const token of newTokens) {
-      // Get bonding status (graduation progress)
-      const bondingUrl = `https://solana-gateway.moralis.io/token/mainnet/${token.mint}/bonding-status`;
-      const bondingResponse = await fetch(bondingUrl, {
-        headers: { 'X-API-Key': MORALIS_API_KEY }
-      });
-      const bonding = await bondingResponse.json();
-
-      if (bonding.bondingComplete) { // Graduated
-        // Check current MC with DexScreener
-        const mcData = await getTokenMarketCap(token.mint);
-        if (mcData.marketCap >= minMC) {
-          graduatedTokens.push({
-            mint: token.mint,
-            symbol: token.symbol,
-            name: token.name,
-            marketCap: mcData.marketCap,
-            graduatedAt: bonding.completedAt,
-            launchAt: token.createdAt
-          });
-        }
-      }
-
-      await new Promise(r => setTimeout(r, 500)); // Rate limit
-    }
-
-    console.log('Found', graduatedTokens.length, 'graduated tokens with MC >', minMC);
-
-    if (graduatedTokens.length === 0) {
-      return res.json({ 
-        success: true,
-        graduatedTokens: [],
-        successfulWallets: [],
-        message: 'No graduated tokens found with high MC. Try lowering minMC.',
-        filter: { minMC }
-      });
-    }
-
-    // Step 3: Find early-buying wallets and score success
-    const walletScores = {};
-
-    for (const token of graduatedTokens) {
-      console.log('Getting early buyers for:', token.symbol);
-      
-      try {
-        // Get snipers/early buyers with Moralis (includes profits)
-        const pairUrl = `https://api.dexscreener.com/latest/dex/tokens/${token.mint}`;
-        const pairResponse = await fetch(pairUrl);
-        const pairData = await pairResponse.json();
-        const pairAddress = pairData.pairs[0]?.pairAddress || null;
-
-        if (pairAddress) {
-          const snipersUrl = `https://solana-gateway.moralis.io/token/mainnet/pairs/${pairAddress}/snipers?blocksAfterCreation=1000`;
-          const snipersResponse = await fetch(snipersUrl, {
-            headers: { 'X-API-Key': MORALIS_API_KEY }
-          });
-          const snipers = await snipersResponse.json();
-
-          if (snipers.result) {
-            for (const sniper of snipers.result) {
-              const walletAddr = sniper.walletAddress;
-              if (!walletScores[walletAddr]) {
-                walletScores[walletAddr] = {
-                  address: walletAddr,
-                  tokensBought: [],
-                  totalProfits: 0,
-                  winRate: 0,
-                  buys: 0
-                };
-              }
-              
-              const profitUsd = sniper.realizedProfitUsd || 0;
-              const profitPercent = sniper.realizedProfitPercentage || 0;
-              walletScores[walletAddr].totalProfits += profitUsd;
-              walletScores[walletAddr].buys += 1;
-              walletScores[walletAddr].winRate = (walletScores[walletAddr].winRate + profitPercent) / walletScores[walletAddr].buys;
-              
-              walletScores[walletAddr].tokensBought.push({
-                symbol: token.symbol,
-                profitUsd: profitUsd,
-                profitPercent: profitPercent,
-                buyTime: sniper.buyTime
-              });
-            }
-          }
-        } else {
-          // Fallback to Helius for transactions
-          const txUrl = `https://api.helius.xyz/v0/addresses/${token.mint}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-          const txResponse = await fetch(txUrl);
-          const transactions = await txResponse.json();
-
-          const wallets = new Set();
-          transactions.forEach(tx => {
-            tx.tokenTransfers?.forEach(transfer => {
-              if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
-            });
-          });
-
-          for (const walletAddr of wallets) {
-            if (!walletScores[walletAddr]) {
-              walletScores[walletAddr] = {
-                address: walletAddr,
-                tokensBought: [],
-                totalProfits: 0,
-                winRate: 0,
-                buys: 0
-              };
-            }
-            walletScores[walletAddr].tokensBought.push({ symbol: token.symbol });
-            walletScores[walletAddr].buys += 1;
-          }
-        }
-
-        await new Promise(r => setTimeout(r, 500));
-      } catch (err) {
-        console.error('Error for', token.symbol, ':', err.message);
-      }
-    }
-
-    // Step 4: Score and filter successful traders (win rate >50%, profits >$1K, multiple buys)
-    const successfulWallets = Object.values(walletScores)
-      .filter(w => w.buys >= 3 && w.winRate > 50 && w.totalProfits > 1000)
-      .sort((a, b) => b.totalProfits - a.totalProfits)
-      .slice(0, 20)
-      .map((wallet, index) => ({
-        rank: index + 1,
-        address: wallet.address,
-        totalProfits: wallet.totalProfits,
-        winRate: Math.floor(wallet.winRate),
-        buys: wallet.buys,
-        tokensBought: wallet.tokensBought,
-        nextMoves: 'Track via /api/wallet/:address for recent swaps' // Placeholder - expand if needed
-      }));
-
-    console.log('Found', successfulWallets.length, 'successful early buyers');
-
-    res.json({
-      success: true,
-      graduatedTokens: graduatedTokens,
-      successfulWallets: successfulWallets,
-      analyzedNewTokens: newTokens.length,
-      filter: { minMC },
-      timestamp: new Date()
-    });
-
-  } catch (error) {
-    console.error('Pump.fun tracking error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -555,24 +362,20 @@ app.get('/api/dexscreener/:address', async (req, res) => {
   }
 });
 
-// HOME (added new endpoint)
+// HOME
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Memecoin Tracker API is running', 
+    status: 'LOW CAP HUNTER API is running', 
     timestamp: new Date(),
     uptime: process.uptime(),
-    endpoints: {
-      discover: '/api/discover?minPump=100',
-      wallet: '/api/wallet/:address?minTrades=3',
-      dexscreener: '/api/dexscreener/:address',
-      pumpfun_track: '/api/pumpfun/track?minMC=1000000' // New!
-    }
+    note: 'Now includes negative price changes to find high-ROI traders who sold before dips'
   });
 });
 
-// Start server
 app.use(cors());
 app.use(express.json());
+
+loadTokenRegistry();
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
