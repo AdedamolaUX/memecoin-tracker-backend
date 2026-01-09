@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 3001;
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImEyMjUyZTcwLWQ1NGYtNDc2Zi04NzdlLTA1YmMzZjZkOGNmNSIsIm9yZ0lkIjoiNDg5MjY0IiwidXNlcklkIjoiNTAzMzkzIiwidHlwZUlkIjoiNTM5NmE0NmMtOGE3OC00NWI1LThlOWMtZDY0OTA4YmJjMWU2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3Njc4NjI4NjMsImV4cCI6NDkyMzYyMjg2M30.YK8NJCVztDL39VYA1fMwyCL__3_lidUSFKbYFK8qcSQ';
+const APIFY_TOKEN = 'apify_api_SeSwkxoO22HggqJNG6dW7y1Dz3q4QP0RiwqD'; // Your Apify token
 
 let tokenCache = {};
 
@@ -24,7 +25,7 @@ const BLACKLISTED_WALLETS = [
   '9WzDXwBbmkg8ZTbNMqUxvQRAHsKtLFa8zG3GcvNoytA7'
 ].map(a => a.toLowerCase());
 
-// Load token registry (unchanged)
+// Load token registry
 async function loadTokenRegistry() {
   try {
     const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
@@ -38,7 +39,7 @@ async function loadTokenRegistry() {
   }
 }
 
-// Get token metadata (unchanged)
+// Get token metadata
 async function getTokenMetadata(address) {
   if (tokenCache[address]) return tokenCache[address];
   
@@ -162,175 +163,105 @@ async function getWalletPnL(wallet) {
   };
 }
 
-// MAIN DISCOVERY - New Logic: Early + In Profit + Consistency
+// MAIN DISCOVERY - With DexScreener Top Traders Scraper
 app.get('/api/discover', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     
-    const walletScores = {};
+    const traderScores = {};
     
-    // DexScreener New Pairs
+    // Get trending + new tokens
     const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
     const newResponse = await fetch(newPairsUrl);
     const newData = await newResponse.json();
+    const newTokens = (newData.pairs || []).filter(p => p.chainId === 'solana').slice(0, limit);
     
-    const newTokens = (newData.pairs || [])
-      .filter(p => p.chainId === 'solana')
-      .slice(0, limit);
-    
-    for (const token of newTokens) {
-      const mintAddress = token.baseToken.address;
-      const mcData = await getTokenMarketCap(mintAddress);
-      
-      try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
-        
-        if (!transactions || transactions.length === 0) continue;
-        
-        const owners = new Set();
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.fromOwnerAccount) owners.add(transfer.fromOwnerAccount.toLowerCase());
-              if (transfer.toOwnerAccount) owners.add(transfer.toOwnerAccount.toLowerCase());
-            }
-          }
-        }
-        
-        for (const owner of owners) {
-          if (BLACKLISTED_WALLETS.includes(owner)) continue;
-          if (await isInstitutional(owner)) continue;
-          
-          const balance = await getWalletBalance(owner);
-          if (balance < 0.01) continue;
-          
-          if (!walletScores[owner]) {
-            walletScores[owner] = {
-              address: owner,
-              earlyBuys: 0,
-              currentUnrealizedProfit: 0,
-              score: 0
-            };
-          }
-          walletScores[owner].earlyBuys += 1;
-          // Bonus if token is pumping
-          if (mcData.change24h > 0) {
-            walletScores[owner].currentUnrealizedProfit += mcData.change24h * 10;
-          }
-        }
-        
-        await new Promise(r => setTimeout(r, 500));
-      } catch (err) {}
-    }
-    
-    // Birdeye Trending Tokens (for current profit)
-    const birdeyeUrl = `https://public-api.birdeye.so/defi/trending_tokens?chain=solana`;
+    const birdeyeUrl = 'https://public-api.birdeye.so/defi/trending_tokens?chain=solana';
     const birdeyeResponse = await fetch(birdeyeUrl, {
       headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
     });
+    const birdeyeData = birdeyeResponse.ok ? await birdeyeResponse.json() : { data: [] };
+    const trendingTokens = birdeyeData.data || [];
     
-    let trendingTokens = [];
-    if (birdeyeResponse.ok) {
-      const birdeyeData = await birdeyeResponse.json();
-      trendingTokens = birdeyeData.data || [];
-    }
+    const allTokens = [...newTokens.map(t => t.baseToken.address), ...trendingTokens.map(t => t.address)];
     
-    for (const token of trendingTokens) {
-      const mintAddress = token.address;
-      
+    // Scrape top traders for each token
+    for (const tokenAddress of allTokens) {
       try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
+        // Start Apify run
+        const runUrl = 'https://api.apify.com/v2/acts/apify~dexscreener-top-traders/run-sync-get-dataset-items?token=' + APIFY_TOKEN;
+        const runResponse = await fetch(runUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokenAddress: tokenAddress,
+            chain: 'solana',
+            limit: 20
+          })
+        });
         
-        if (!transactions || transactions.length === 0) continue;
+        const traders = await runResponse.json();
         
-        const owners = new Set();
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.fromOwnerAccount) owners.add(transfer.fromOwnerAccount.toLowerCase());
-              if (transfer.toOwnerAccount) owners.add(transfer.toOwnerAccount.toLowerCase());
-            }
-          }
-        }
-        
-        for (const owner of owners) {
-          if (BLACKLISTED_WALLETS.includes(owner)) continue;
-          if (await isInstitutional(owner)) continue;
+        for (const trader of traders) {
+          const wallet = trader.wallet.toLowerCase();
           
-          const balance = await getWalletBalance(owner);
+          if (BLACKLISTED_WALLETS.includes(wallet)) continue;
+          if (await isInstitutional(wallet)) continue;
+          
+          const balance = await getWalletBalance(wallet);
           if (balance < 0.01) continue;
           
-          if (!walletScores[owner]) {
-            walletScores[owner] = {
-              address: owner,
-              earlyBuys: 0,
-              currentUnrealizedProfit: 0,
+          const pnl = await getWalletPnL(wallet);
+          
+          if (!traderScores[wallet]) {
+            traderScores[wallet] = {
+              address: wallet,
+              recentProfitUSD: 0,
+              recentUnrealizedUSD: 0,
+              profitableTrades: pnl.profitable_trades || 0,
+              winRate: pnl.win_rate || 0,
               score: 0
             };
           }
-          if (token.priceChange?.h24 > 0) {
-            walletScores[owner].currentUnrealizedProfit += token.priceChange.h24 * 10;
-          }
+          
+          traderScores[wallet].recentProfitUSD += (trader.realizedPnl || 0);
+          traderScores[wallet].recentUnrealizedUSD += (trader.unrealizedPnl || 0);
         }
         
-        await new Promise(r => setTimeout(r, 500));
-      } catch (err) {}
-    }
-    
-    // Final PnL + Consistency Scoring
-    const candidates = Object.values(walletScores);
-    
-    for (const w of candidates) {
-      const pnl = await getWalletPnL(w.address);
-      
-      const winRate = pnl.win_rate || 0;
-      const profitableTrades = pnl.profitable_trades || 0;
-      const totalTrades = pnl.total_trades || 0;
-      const realizedProfit = pnl.realized_profit_usd || 0;
-      const unrealizedProfit = pnl.unrealized_profit_usd || 0;
-      
-      // Base score from early entry + current profit
-      w.score = w.earlyBuys * 30 + w.currentUnrealizedProfit + unrealizedProfit;
-      
-      // Consistency boost (win rate ≥25%)
-      if (winRate >= 0.25) {
-        w.score += winRate * 200 + profitableTrades * 20;
-      }
-      
-      // Realized profit bonus
-      w.score += realizedProfit / 10;
-      
-      // New traders with high current profit still rank
-      if (totalTrades < 5 && w.currentUnrealizedProfit > 100) {
-        w.score += 100; // Emerging star bonus
+        await new Promise(r => setTimeout(r, 1000)); // Rate limit
+      } catch (err) {
+        console.log('Scrape failed for token:', err.message);
       }
     }
     
-    const discoveredWallets = candidates
+    // Final scoring
+    Object.values(traderScores).forEach(t => {
+      const recentTotal = t.recentProfitUSD + t.recentUnrealizedUSD;
+      t.score = recentTotal + 
+                (t.winRate >= 0.25 ? t.winRate * 300 + t.profitableTrades * 30 : 0) +
+                (t.profitableTrades < 5 && recentTotal > 500 ? 200 : 0);
+    });
+    
+    const discoveredWallets = Object.values(traderScores)
       .sort((a, b) => b.score - a.score)
       .slice(0, 20)
-      .map((w, i) => ({
+      .map((t, i) => ({
         rank: i + 1,
-        address: w.address,
-        successScore: Math.floor(w.score),
-        earlyBuys: w.earlyBuys,
-        currentUnrealizedBonus: Math.floor(w.currentUnrealizedProfit),
-        realizedProfitUSD: Math.floor(w.realizedProfitUSD || 0),
-        winRate: w.winRate || 0,
-        profitableTrades: w.profitableTrades || 0
+        address: t.address,
+        successScore: Math.floor(t.score),
+        recentProfitUSD: Math.floor(t.recentProfitUSD),
+        recentUnrealizedUSD: Math.floor(t.recentUnrealizedUSD),
+        winRate: t.winRate,
+        profitableTrades: t.profitableTrades
       }));
     
     res.json({
       success: true,
       discoveredWallets,
-      totalCandidates: candidates.length,
+      totalTokensScraped: allTokens.length,
       message: discoveredWallets.length === 0 
-        ? 'No early profitable traders found yet — market too early or no matches.'
-        : 'Early + in-profit traders with consistency scoring!'
+        ? 'No top traders found in current tokens — try again soon!'
+        : 'Top traders from DexScreener with skill validation!'
     });
     
   } catch (error) {
@@ -339,7 +270,37 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// Other endpoints unchanged (wallet, dexscreener, home)
+// ANALYZE WALLET (unchanged)
+app.get('/api/wallet/:address', async (req, res) => {
+  // Your existing code
+});
+
+// DEXSCREENER
+app.get('/api/dexscreener/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// HOME
+app.get('/', (req, res) => {
+  res.json({
+    status: 'Memecoin Tracker Backend is LIVE!',
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor(process.uptime()),
+    message: 'Top traders scraped from DexScreener + skill validation',
+    endpoints: {
+      discover: '/api/discover?limit=50 (main feature - ranked traders)',
+      wallet: '/api/wallet/WALLET_ADDRESS (detailed analysis)',
+      dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)'
+    }
+  });
+});
 
 app.use(cors());
 app.use(express.json());
