@@ -5,7 +5,7 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ALL KEYS ARE NOW ENVIRONMENT VARIABLES (SAFE & SECURE)
+// ALL KEYS ARE ENVIRONMENT VARIABLES - NO SECRETS IN CODE
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
@@ -13,7 +13,7 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
 
 let tokenCache = {};
 
-// Expanded blacklist
+// Expanded blacklist for institutions/bots
 const BLACKLISTED_WALLETS = [
   'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4',
   '675kpx9mhtjs2zt1qfr1nyhuzelxfqm9h24wfsut1nds',
@@ -296,7 +296,7 @@ app.get('/api/discover', async (req, res) => {
       const realizedProfit = pnl.realized_profit_usd || 0;
       const unrealizedProfit = pnl.unrealized_profit_usd || 0;
       
-      // Base: Early + current unrealized
+      // Base: Early entry + current unrealized profit
       w.score = w.earlyBuys * 30 + w.currentUnrealizedBonus + unrealizedProfit;
       
       // Consistency boost (win rate ≥25%)
@@ -307,7 +307,7 @@ app.get('/api/discover', async (req, res) => {
       // Realized profit bonus
       w.score += realizedProfit / 10;
       
-      // Emerging trader bonus
+      // Emerging trader bonus: high current profit, low history
       if (totalTrades < 5 && (w.currentUnrealizedBonus + unrealizedProfit) > 500) {
         w.score += 200;
       }
@@ -348,11 +348,141 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// ANALYZE WALLET (your existing code - unchanged)
+// ANALYZE WALLET - Your existing code (keep as is)
+app.get('/api/wallet/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    
+    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
+    const minSuccessRate = parseInt(req.query.minRate) || 40;
+    const minLowCapTrades = parseInt(req.query.minTrades) || 3;
+    
+    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
+    const response = await fetch(url);
+    const transactions = await response.json();
+    
+    if (!transactions || transactions.length === 0) {
+      return res.json({
+        address,
+        isEarlyEntrySpecialist: false,
+        lowCapEntries: 0,
+        totalTrades: 0,
+        earlyEntryRate: 0,
+        successfulLowCapExits: 0,
+        filters: { maxMarketCap, minSuccessRate, minLowCapTrades },
+        error: 'No transactions found'
+      });
+    }
+    
+    const swaps = transactions.filter(tx => 
+      tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
+    );
+    
+    const tokenSet = new Set();
+    const tokenEntries = {};
+    
+    for (const tx of swaps) {
+      if (tx.tokenTransfers) {
+        for (const transfer of tx.tokenTransfers) {
+          if (transfer.mint && transfer.mint !== 'So11111111111111111111111111111111111111112') {
+            tokenSet.add(transfer.mint);
+            if (!tokenEntries[transfer.mint]) {
+              tokenEntries[transfer.mint] = { firstSeen: tx.timestamp };
+            }
+          }
+        }
+      }
+    }
+    
+    let lowCapEntries = 0;
+    let successfulLowCapTrades = 0;
+    const analyzedTokens = [];
+    
+    const recentTokens = Array.from(tokenSet).slice(0, 5);
+    
+    for (const tokenAddr of recentTokens) {
+      const metadata = await getTokenMetadata(tokenAddr);
+      const mcData = await getTokenMarketCap(tokenAddr);
+      
+      const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
+      const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
+      
+      if (meetsLowCapCriteria || isVeryNew) {
+        lowCapEntries++;
+        if (mcData.marketCap > maxMarketCap * 10) {
+          successfulLowCapTrades++;
+        }
+      }
+      
+      analyzedTokens.push({
+        address: tokenAddr,
+        symbol: metadata.symbol,
+        name: metadata.name,
+        currentMC: mcData.marketCap,
+        meetsFilter: meetsLowCapCriteria,
+        isNew: isVeryNew,
+        firstTradedBy: new Date(tokenEntries[tokenAddr].firstSeen * 1000).toISOString()
+      });
+      
+      await new Promise(r => setTimeout(r, 300));
+    }
+    
+    const earlyEntryRate = swaps.length > 0 ? Math.floor((lowCapEntries / Math.min(swaps.length, 20)) * 100) : 0;
+    const isSpecialist = lowCapEntries >= minLowCapTrades && earlyEntryRate >= minSuccessRate;
+    
+    const analysis = {
+      address,
+      isEarlyEntrySpecialist: isSpecialist,
+      lowCapEntries: lowCapEntries,
+      totalTrades: swaps.length,
+      earlyEntryRate: earlyEntryRate,
+      successfulLowCapExits: successfulLowCapTrades,
+      score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
+      analyzedTokens: analyzedTokens,
+      lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
+      specialistBadge: isSpecialist ? 'EARLY ENTRY SPECIALIST' : null,
+      filters: {
+        maxMarketCap,
+        minSuccessRate,
+        minLowCapTrades
+      }
+    };
+    
+    res.json(analysis);
+    
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
-// DEXSCREENER (unchanged)
+// DEXSCREENER
+app.get('/api/dexscreener/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-// HOME (unchanged)
+// HOME
+app.get('/', (req, res) => {
+  res.json({
+    status: 'Memecoin Tracker Backend is LIVE!',
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor(process.uptime()),
+    message: 'Your successful trader discovery API is ready.',
+    endpoints: {
+      discover: '/api/discover?limit=50 (main feature - ranked traders)',
+      wallet: '/api/wallet/WALLET_ADDRESS (detailed analysis)',
+      dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)'
+    },
+    tip: 'All keys secure via environment variables!'
+  });
+});
 
 app.use(cors());
 app.use(express.json());
