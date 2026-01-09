@@ -5,12 +5,16 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// MUST be at the top
+app.use(cors());
+app.use(express.json());
+
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
 
-// Load token registry (unchanged)
+// Load token registry
 async function loadTokenRegistry() {
   try {
     const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
@@ -24,7 +28,7 @@ async function loadTokenRegistry() {
   }
 }
 
-// Get token metadata (unchanged)
+// Get token metadata
 async function getTokenMetadata(address) {
   if (tokenCache[address]) return tokenCache[address];
   
@@ -58,7 +62,7 @@ async function getTokenMetadata(address) {
   return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
 }
 
-// Get market cap and change
+// Get market cap
 async function getTokenMarketCap(address) {
   try {
     const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
@@ -71,131 +75,265 @@ async function getTokenMarketCap(address) {
         priceUsd: parseFloat(pair.priceUsd) || 0,
         change24h: pair.priceChange?.h24 || 0,
         volume24h: pair.volume?.h24 || 0,
-        age: pair.pairCreatedAt ? Date.now() - new Date(pair.pairCreatedAt).getTime() : null
+        liquidity: pair.liquidity?.usd || 0,
+        age: pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : null
       };
     }
   } catch (err) {}
-  return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, age: null };
+  return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, liquidity: 0, age: null };
 }
 
-// ANALYZE WALLET (unchanged)
+// ANALYZE WALLET
 app.get('/api/wallet/:address', async (req, res) => {
-  // Keep your existing code
+  try {
+    const { address } = req.params;
+    
+    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
+    const minSuccessRate = parseInt(req.query.minRate) || 40;
+    const minLowCapTrades = parseInt(req.query.minTrades) || 3;
+    
+    console.log('Analyzing wallet:', address);
+    console.log('Filters: MC <', maxMarketCap, 'Rate >', minSuccessRate + '%', 'Trades >', minLowCapTrades);
+    
+    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
+    const response = await fetch(url);
+    const transactions = await response.json();
+    
+    if (!transactions || transactions.length === 0) {
+      return res.json({
+        address,
+        isEarlyEntrySpecialist: false,
+        lowCapEntries: 0,
+        totalTrades: 0,
+        earlyEntryRate: 0,
+        successfulLowCapExits: 0,
+        filters: { maxMarketCap, minSuccessRate, minLowCapTrades },
+        error: 'No transactions found'
+      });
+    }
+    
+    const swaps = transactions.filter(tx => 
+      tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
+    );
+    
+    const tokenSet = new Set();
+    const tokenEntries = {};
+    
+    for (const tx of swaps) {
+      if (tx.tokenTransfers) {
+        for (const transfer of tx.tokenTransfers) {
+          if (transfer.mint && transfer.mint !== 'So11111111111111111111111111111111111111112') {
+            tokenSet.add(transfer.mint);
+            if (!tokenEntries[transfer.mint]) {
+              tokenEntries[transfer.mint] = { firstSeen: tx.timestamp, address: transfer.mint };
+            }
+          }
+        }
+      }
+    }
+    
+    console.log('Found', tokenSet.size, 'unique tokens');
+    
+    let lowCapEntries = 0;
+    let successfulLowCapTrades = 0;
+    const analyzedTokens = [];
+    
+    const recentTokens = Array.from(tokenSet).slice(0, 5);
+    
+    for (const tokenAddr of recentTokens) {
+      const metadata = await getTokenMetadata(tokenAddr);
+      const mcData = await getTokenMarketCap(tokenAddr);
+      
+      const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
+      const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
+      
+      if (meetsLowCapCriteria || isVeryNew) {
+        lowCapEntries++;
+        if (mcData.marketCap > maxMarketCap * 10) {
+          successfulLowCapTrades++;
+        }
+      }
+      
+      analyzedTokens.push({
+        address: tokenAddr,
+        symbol: metadata.symbol,
+        name: metadata.name,
+        currentMC: mcData.marketCap,
+        meetsFilter: meetsLowCapCriteria,
+        isNew: isVeryNew,
+        firstTradedBy: new Date(tokenEntries[tokenAddr].firstSeen * 1000).toISOString()
+      });
+      
+      await new Promise(r => setTimeout(r, 300));
+    }
+    
+    const earlyEntryRate = swaps.length > 0 ? Math.floor((lowCapEntries / Math.min(swaps.length, 20)) * 100) : 0;
+    const isSpecialist = lowCapEntries >= minLowCapTrades && earlyEntryRate >= minSuccessRate;
+    
+    const analysis = {
+      address,
+      isEarlyEntrySpecialist: isSpecialist,
+      lowCapEntries: lowCapEntries,
+      totalTrades: swaps.length,
+      earlyEntryRate: earlyEntryRate,
+      successfulLowCapExits: successfulLowCapTrades,
+      score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
+      analyzedTokens: analyzedTokens,
+      lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
+      specialistBadge: isSpecialist ? 'EARLY ENTRY SPECIALIST' : null,
+      filters: {
+        maxMarketCap,
+        minSuccessRate,
+        minLowCapTrades
+      }
+    };
+    
+    console.log('Result:', isSpecialist ? 'SPECIALIST' : 'Regular', '| Low cap:', lowCapEntries, '| Rate:', earlyEntryRate + '%');
+    
+    res.json(analysis);
+    
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
-// DISCOVERY - With Adjustable Filters for More Wallets
+// DISCOVERY - Multi-source with adjustable filters
 app.get('/api/discover', async (req, res) => {
   try {
-    const tokenLimit = Math.min(parseInt(req.query.limit) || 50, 100); // Max 100 tokens
-    const topCount = Math.min(parseInt(req.query.top) || 20, 50); // Return up to 50 wallets
-    const minScore = parseInt(req.query.minScore) || 0; // Minimum successScore
-    const minEarly = parseInt(req.query.minEarly) || 0; // Minimum earlyBuys
+    const tokenLimit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const topCount = Math.min(parseInt(req.query.top) || 20, 50);
+    const minScore = parseInt(req.query.minScore) || 0;
+    const minEarly = parseInt(req.query.minEarly) || 0;
+
+    console.log('Starting discovery with limits:', { tokenLimit, topCount, minScore, minEarly });
 
     const walletScores = {};
+    let tokensAnalyzed = 0;
     
-    // DexScreener New Pairs
-    const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
-    const newResponse = await fetch(newPairsUrl);
-    const newData = await newResponse.json();
-    
-    const newTokens = (newData.pairs || [])
-      .filter(p => p.chainId === 'solana')
-      .slice(0, tokenLimit);
-    
-    for (const token of newTokens) {
-      const mintAddress = token.baseToken.address;
-      const mcData = await getTokenMarketCap(mintAddress);
+    // SOURCE 1: DexScreener New Pairs
+    console.log('Fetching from DexScreener...');
+    try {
+      const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
+      const newResponse = await fetch(newPairsUrl);
+      const newData = await newResponse.json();
       
-      try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
+      const newTokens = (newData.pairs || [])
+        .filter(p => p.chainId === 'solana')
+        .slice(0, tokenLimit);
+      
+      console.log(`Found ${newTokens.length} new Solana pairs`);
+      
+      for (const token of newTokens) {
+        const mintAddress = token.baseToken.address;
+        const mcData = await getTokenMarketCap(mintAddress);
         
-        if (!transactions || transactions.length === 0) continue;
-        
-        const wallets = new Set();
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
-              if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+        try {
+          const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+          const txResponse = await fetch(txUrl);
+          const transactions = await txResponse.json();
+          
+          if (!transactions || transactions.length === 0) continue;
+          
+          tokensAnalyzed++;
+          const wallets = new Set();
+          for (const tx of transactions) {
+            if (tx.tokenTransfers) {
+              for (const transfer of tx.tokenTransfers) {
+                if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
+                if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+              }
             }
           }
-        }
-        
-        for (const wallet of wallets) {
-          if (!walletScores[wallet]) {
-            walletScores[wallet] = {
-              address: wallet,
-              earlyBuys: 0,
-              totalTokens: 0,
-              totalChangeBonus: 0,
-              score: 0
-            };
+          
+          for (const wallet of wallets) {
+            if (!walletScores[wallet]) {
+              walletScores[wallet] = {
+                address: wallet,
+                earlyBuys: 0,
+                totalTokens: 0,
+                totalChangeBonus: 0,
+                score: 0
+              };
+            }
+            walletScores[wallet].earlyBuys += 1;
+            walletScores[wallet].totalTokens += 1;
+            walletScores[wallet].totalChangeBonus += (mcData.change24h > 0 ? mcData.change24h : 0);
           }
-          walletScores[wallet].earlyBuys += 1;
-          walletScores[wallet].totalTokens += 1;
-          walletScores[wallet].totalChangeBonus += (mcData.change24h > 0 ? mcData.change24h : 0);
+          
+          await new Promise(r => setTimeout(r, 500));
+        } catch (err) {
+          console.error('Error processing token:', err.message);
         }
-        
-        await new Promise(r => setTimeout(r, 500));
-      } catch (err) {}
-    }
-    
-    // Birdeye Token List
-    const birdeyeUrl = `https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=desc&offset=0&limit=${tokenLimit}`;
-    const birdeyeResponse = await fetch(birdeyeUrl, {
-      headers: {
-        'X-API-KEY': BIRDEYE_API_KEY,
-        'x-chain': 'solana'
       }
-    });
-    
-    let birdeyeTokens = [];
-    if (birdeyeResponse.ok) {
-      const birdeyeData = await birdeyeResponse.json();
-      birdeyeTokens = (birdeyeData.data?.tokens || []).slice(0, tokenLimit);
+    } catch (err) {
+      console.error('DexScreener error:', err.message);
     }
     
-    for (const token of birdeyeTokens) {
-      const mintAddress = token.address;
+    // SOURCE 2: Birdeye Token List
+    console.log('Fetching from Birdeye...');
+    try {
+      const birdeyeUrl = `https://public-api.birdeye.so/defi/tokenlist?sort_by=mc&sort_type=desc&offset=0&limit=${tokenLimit}`;
+      const birdeyeResponse = await fetch(birdeyeUrl, {
+        headers: {
+          'X-API-KEY': BIRDEYE_API_KEY,
+          'x-chain': 'solana'
+        }
+      });
       
-      try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
+      if (birdeyeResponse.ok) {
+        const birdeyeData = await birdeyeResponse.json();
+        const birdeyeTokens = (birdeyeData.data?.tokens || []).slice(0, tokenLimit);
         
-        if (!transactions || transactions.length === 0) continue;
+        console.log(`Found ${birdeyeTokens.length} Birdeye tokens`);
         
-        const wallets = new Set();
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
-              if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+        for (const token of birdeyeTokens) {
+          const mintAddress = token.address;
+          
+          try {
+            const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+            const txResponse = await fetch(txUrl);
+            const transactions = await txResponse.json();
+            
+            if (!transactions || transactions.length === 0) continue;
+            
+            tokensAnalyzed++;
+            const wallets = new Set();
+            for (const tx of transactions) {
+              if (tx.tokenTransfers) {
+                for (const transfer of tx.tokenTransfers) {
+                  if (transfer.toUserAccount) wallets.add(transfer.toUserAccount);
+                  if (transfer.fromUserAccount) wallets.add(transfer.fromUserAccount);
+                }
+              }
             }
+            
+            for (const wallet of wallets) {
+              if (!walletScores[wallet]) {
+                walletScores[wallet] = {
+                  address: wallet,
+                  earlyBuys: 0,
+                  totalTokens: 0,
+                  totalChangeBonus: 0,
+                  score: 0
+                };
+              }
+              walletScores[wallet].totalTokens += 1;
+              const changeBonus = (token.v24hChangePercent || 0) > 0 ? (token.v24hChangePercent || 0) : 0;
+              walletScores[wallet].totalChangeBonus += changeBonus;
+            }
+            
+            await new Promise(r => setTimeout(r, 500));
+          } catch (err) {
+            console.error('Error processing Birdeye token:', err.message);
           }
         }
-        
-        for (const wallet of wallets) {
-          if (!walletScores[wallet]) {
-            walletScores[wallet] = {
-              address: wallet,
-              earlyBuys: 0,
-              totalTokens: 0,
-              totalChangeBonus: 0,
-              score: 0
-            };
-          }
-          walletScores[wallet].totalTokens += 1;
-          walletScores[wallet].totalChangeBonus += (token.priceChange?.h24 || 0 > 0 ? token.priceChange?.h24 || 0 : 0);
-        }
-        
-        await new Promise(r => setTimeout(r, 500));
-      } catch (err) {}
+      }
+    } catch (err) {
+      console.error('Birdeye error:', err.message);
     }
     
-    // Calculate score
+    // Calculate scores
     Object.values(walletScores).forEach(w => {
       w.score = (w.earlyBuys * 10) + w.totalTokens + Math.floor(w.totalChangeBonus);
     });
@@ -204,7 +342,7 @@ app.get('/api/discover', async (req, res) => {
     let filteredWallets = Object.values(walletScores)
       .filter(w => w.score >= minScore && w.earlyBuys >= minEarly);
     
-    // Sort and slice
+    // Sort and return top wallets
     const discoveredWallets = filteredWallets
       .sort((a, b) => b.score - a.score)
       .slice(0, topCount)
@@ -217,14 +355,16 @@ app.get('/api/discover', async (req, res) => {
         positiveChangeBonus: Math.floor(w.totalChangeBonus)
       }));
     
+    console.log(`Discovery complete: ${discoveredWallets.length} wallets found`);
+    
     res.json({
       success: true,
       discoveredWallets,
       totalWalletsBeforeFilter: Object.keys(walletScores).length,
       totalWalletsAfterFilter: filteredWallets.length,
-      tokensAnalyzed: newTokens.length + birdeyeTokens.length,
+      tokensAnalyzed,
       appliedFilters: { tokenLimit, topCount, minScore, minEarly },
-      message: 'Use ?limit=100&top=50&minScore=0&minEarly=0 for maximum wallets!',
+      message: 'Use ?limit=100&top=50&minScore=0&minEarly=0 for maximum wallets',
       timestamp: new Date()
     });
     
@@ -234,13 +374,35 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// Other endpoints unchanged (wallet, dexscreener, home)
+// DEXSCREENER
+app.get('/api/dexscreener/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-app.use(cors());
-app.use(express.json());
+// HOME
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'LOW CAP HUNTER API - Multi-Source Discovery',
+    endpoints: {
+      wallet: '/api/wallet/:address?maxMC=1000000&minRate=40&minTrades=3',
+      discover: '/api/discover?limit=50&top=20&minScore=0&minEarly=0',
+      dexscreener: '/api/dexscreener/:address'
+    },
+    sources: ['DexScreener', 'Birdeye', 'Helius'],
+    timestamp: new Date() 
+  });
+});
 
+// Start server
 loadTokenRegistry();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log('LOW CAP HUNTER API running on port', PORT);
 });
