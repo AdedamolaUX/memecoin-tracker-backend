@@ -13,7 +13,7 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
 
 let tokenCache = {};
 
-// Blacklist (kept but less strict)
+// Blacklist
 const BLACKLISTED_WALLETS = [
   'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4',
   '675kpx9mhtjs2zt1qfr1nyhuzelxfqm9h24wfsut1nds',
@@ -94,7 +94,7 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, age: null };
 }
 
-// Get wallet balance in SOL (relaxed - no check)
+// Get wallet balance in SOL
 async function getWalletBalance(wallet) {
   try {
     const url = `https://api.helius.xyz/v0/addresses/${wallet}/balance?api-key=${HELIUS_API_KEY}`;
@@ -143,154 +143,113 @@ async function getWalletPnL(wallet) {
   };
 }
 
-// MAIN DISCOVERY - DEBUG MODE: NO LIMITS, MAX DISCOVERY
+// MAIN DISCOVERY - With DexScreener Top Traders Scraping
 app.get('/api/discover', async (req, res) => {
   try {
-    const limit = 200; // MAX possible
+    const limit = parseInt(req.query.limit) || 50;
     
-    const walletScores = {};
+    const traderScores = {};
     
-    // DexScreener New Pairs
-    console.log('Fetching new pairs from DexScreener...');
+    // Get trending + new tokens
     const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
     const newResponse = await fetch(newPairsUrl);
     const newData = await newResponse.json();
+    const newTokens = (newData.pairs || []).filter(p => p.chainId === 'solana').slice(0, limit);
     
-    const newTokens = (newData.pairs || [])
-      .filter(p => p.chainId === 'solana')
-      .slice(0, limit);
-    
-    for (const token of newTokens) {
-      const mintAddress = token.baseToken.address;
-      const mcData = await getTokenMarketCap(mintAddress);
-      
-      try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
-        
-        if (!transactions || transactions.length === 0) continue;
-        
-        const owners = new Set();
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.fromOwnerAccount) owners.add(transfer.fromOwnerAccount.toLowerCase());
-              if (transfer.toOwnerAccount) owners.add(transfer.toOwnerAccount.toLowerCase());
-            }
-          }
-        }
-        
-        for (const owner of owners) {
-          if (BLACKLISTED_WALLETS.includes(owner)) continue;
-          
-          // NO balance check
-          // NO institutional check
-          
-          if (!walletScores[owner]) {
-            walletScores[owner] = {
-              address: owner,
-              earlyBuys: 0,
-              currentUnrealizedBonus: 0,
-              score: 0
-            };
-          }
-          walletScores[owner].earlyBuys += 1;
-          if (mcData.change24h > 0) {
-            walletScores[owner].currentUnrealizedBonus += mcData.change24h * 20; // Heavy bonus
-          }
-        }
-        
-        await new Promise(r => setTimeout(r, 300));
-      } catch (err) {}
-    }
-    
-    // Birdeye Trending Tokens
-    console.log('Fetching trending tokens from Birdeye...');
     const birdeyeUrl = 'https://public-api.birdeye.so/defi/trending_tokens?chain=solana';
     const birdeyeResponse = await fetch(birdeyeUrl, {
       headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
     });
+    const birdeyeData = birdeyeResponse.ok ? await birdeyeResponse.json() : { data: [] };
+    const trendingTokens = birdeyeData.data || [];
     
-    let trendingTokens = [];
-    if (birdeyeResponse.ok) {
-      const birdeyeData = await birdeyeResponse.json();
-      trendingTokens = birdeyeData.data || [];
-    }
+    const allTokens = [...newTokens.map(t => t.baseToken.address), ...trendingTokens.map(t => t.address)];
     
-    for (const token of trendingTokens) {
-      const mintAddress = token.address;
+    // Scrape top traders using Apify
+    for (const tokenAddress of allTokens) {
+      if (!APIFY_TOKEN) {
+        console.log('APIFY_TOKEN not set - skipping scraping');
+        continue;
+      }
       
       try {
-        const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
-        const txResponse = await fetch(txUrl);
-        const transactions = await txResponse.json();
+        // Start sync run
+        const runUrl = `https://api.apify.com/v2/acts/crypto-scraper~dexscreener-top-traders-scraper/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+        const runResponse = await fetch(runUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokens: [{ chain: 'solana', address: tokenAddress }],
+            limit: 20
+          })
+        });
         
-        if (!transactions || transactions.length === 0) continue;
-        
-        const owners = new Set();
-        for (const tx of transactions) {
-          if (tx.tokenTransfers) {
-            for (const transfer of tx.tokenTransfers) {
-              if (transfer.fromOwnerAccount) owners.add(transfer.fromOwnerAccount.toLowerCase());
-              if (transfer.toOwnerAccount) owners.add(transfer.toOwnerAccount.toLowerCase());
-            }
-          }
+        if (!runResponse.ok) {
+          console.log('Apify run failed:', await runResponse.text());
+          continue;
         }
         
-        for (const owner of owners) {
-          if (BLACKLISTED_WALLETS.includes(owner)) continue;
+        const traders = await runResponse.json();
+        
+        for (const trader of traders) {
+          const wallet = trader.wallet.toLowerCase();
           
-          if (!walletScores[owner]) {
-            walletScores[owner] = {
-              address: owner,
-              earlyBuys: 0,
-              currentUnrealizedBonus: 0,
+          if (BLACKLISTED_WALLETS.includes(wallet)) continue;
+          
+          const balance = await getWalletBalance(wallet);
+          if (balance < 0.01) continue;
+          
+          const pnl = await getWalletPnL(wallet);
+          
+          if (!traderScores[wallet]) {
+            traderScores[wallet] = {
+              address: wallet,
+              recentProfitUSD: 0,
+              recentUnrealizedUSD: 0,
+              profitableTrades: pnl.profitable_trades || 0,
+              winRate: pnl.win_rate || 0,
               score: 0
             };
           }
-          if (token.priceChange?.h24 > 0) {
-            walletScores[owner].currentUnrealizedBonus += token.priceChange.h24 * 20;
-          }
+          
+          traderScores[wallet].recentProfitUSD += (trader.realizedPnl || 0);
+          traderScores[wallet].recentUnrealizedUSD += (trader.unrealizedPnl || 0);
         }
         
-        await new Promise(r => setTimeout(r, 300));
-      } catch (err) {}
+        await new Promise(r => setTimeout(r, 1200)); // Rate limit
+      } catch (err) {
+        console.log('Scraping error for token', tokenAddress, err.message);
+      }
     }
     
-    // Final scoring - very loose
-    const candidates = Object.values(walletScores);
+    // Final scoring
+    Object.values(traderScores).forEach(t => {
+      const recentTotal = t.recentProfitUSD + t.recentUnrealizedUSD;
+      t.score = recentTotal + 
+                (t.winRate >= 0.25 ? t.winRate * 300 + t.profitableTrades * 30 : 0) +
+                (t.profitableTrades < 5 && recentTotal > 500 ? 200 : 0);
+    });
     
-    for (const w of candidates) {
-      const pnl = await getWalletPnL(w.address);
-      
-      w.score = w.earlyBuys * 50 + w.currentUnrealizedBonus + (pnl.unrealized_profit_usd || 0) + (pnl.realized_profit_usd || 0);
-      
-      // No win rate or profitable trades requirement
-      w.realizedProfitUSD = pnl.realized_profit_usd || 0;
-      w.unrealizedProfitUSD = pnl.unrealized_profit_usd || 0;
-    }
-    
-    const discoveredWallets = candidates
+    const discoveredWallets = Object.values(traderScores)
       .sort((a, b) => b.score - a.score)
       .slice(0, 20)
-      .map((w, i) => ({
+      .map((t, i) => ({
         rank: i + 1,
-        address: w.address,
-        successScore: Math.floor(w.score),
-        earlyBuys: w.earlyBuys,
-        currentUnrealizedBonus: Math.floor(w.currentUnrealizedBonus),
-        realizedProfitUSD: Math.floor(w.realizedProfitUSD),
-        unrealizedProfitUSD: Math.floor(w.unrealizedProfitUSD)
+        address: t.address,
+        successScore: Math.floor(t.score),
+        recentProfitUSD: Math.floor(t.recentProfitUSD),
+        recentUnrealizedUSD: Math.floor(t.recentUnrealizedUSD),
+        winRate: t.winRate,
+        profitableTrades: t.profitableTrades
       }));
     
     res.json({
       success: true,
       discoveredWallets,
-      totalCandidates: candidates.length,
+      totalTokensScraped: allTokens.length,
       message: discoveredWallets.length === 0 
-        ? 'No traders found — something is wrong with data fetch.'
-        : 'DEBUG MODE: All traders from new/trending tokens!'
+        ? 'No top traders found in current tokens — try again in a few minutes.'
+        : 'Top traders scraped from DexScreener with skill validation!'
     });
     
   } catch (error) {
@@ -322,13 +281,12 @@ app.get('/', (req, res) => {
     status: 'Memecoin Tracker Backend is LIVE!',
     timestamp: new Date().toISOString(),
     uptime_seconds: Math.floor(process.uptime()),
-    message: 'Your successful trader discovery API is ready.',
+    message: 'Top traders scraped from DexScreener + skill validation',
     endpoints: {
-      discover: '/api/discover (main feature - ranked traders)',
+      discover: '/api/discover?limit=50 (main feature - ranked traders)',
       wallet: '/api/wallet/WALLET_ADDRESS (detailed analysis)',
       dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)'
-    },
-    tip: 'DEBUG MODE ACTIVE - No limits!'
+    }
   });
 });
 
