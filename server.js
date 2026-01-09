@@ -5,7 +5,7 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ALL API KEYS ARE NOW LOADED FROM ENVIRONMENT VARIABLES (SAFE FOR GITHUB)
+// ALL KEYS FROM ENVIRONMENT VARIABLES (NO SECRETS IN CODE)
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
@@ -13,7 +13,7 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
 
 let tokenCache = {};
 
-// Expanded blacklist for institutions/bots
+// Blacklist for institutions/bots
 const BLACKLISTED_WALLETS = [
   'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4',
   '675kpx9mhtjs2zt1qfr1nyhuzelxfqm9h24wfsut1nds',
@@ -164,7 +164,7 @@ async function getWalletPnL(wallet) {
   };
 }
 
-// MAIN DISCOVERY - Early + In Profit + Consistency (Unrealized PnL Included)
+// MAIN DISCOVERY - Relaxed Filters for Current Market
 app.get('/api/discover', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -207,7 +207,7 @@ app.get('/api/discover', async (req, res) => {
           if (await isInstitutional(owner)) continue;
           
           const balance = await getWalletBalance(owner);
-          if (balance < 0.01) continue;
+          if (balance < 0.001) continue; // Relaxed to catch more
           
           if (!walletScores[owner]) {
             walletScores[owner] = {
@@ -219,7 +219,7 @@ app.get('/api/discover', async (req, res) => {
           }
           walletScores[owner].earlyBuys += 1;
           if (mcData.change24h > 0) {
-            walletScores[owner].currentUnrealizedBonus += mcData.change24h * 10;
+            walletScores[owner].currentUnrealizedBonus += mcData.change24h * 15; // Higher bonus for pumps
           }
         }
         
@@ -265,7 +265,7 @@ app.get('/api/discover', async (req, res) => {
           if (await isInstitutional(owner)) continue;
           
           const balance = await getWalletBalance(owner);
-          if (balance < 0.01) continue;
+          if (balance < 0.001) continue;
           
           if (!walletScores[owner]) {
             walletScores[owner] = {
@@ -276,7 +276,7 @@ app.get('/api/discover', async (req, res) => {
             };
           }
           if (token.priceChange?.h24 > 0) {
-            walletScores[owner].currentUnrealizedBonus += token.priceChange.h24 * 10;
+            walletScores[owner].currentUnrealizedBonus += token.priceChange.h24 * 15;
           }
         }
         
@@ -284,7 +284,7 @@ app.get('/api/discover', async (req, res) => {
       } catch (err) {}
     }
     
-    // Final PnL + Consistency Scoring
+    // Final PnL + Relaxed Consistency Scoring
     const candidates = Object.values(walletScores);
     
     for (const w of candidates) {
@@ -296,20 +296,20 @@ app.get('/api/discover', async (req, res) => {
       const realizedProfit = pnl.realized_profit_usd || 0;
       const unrealizedProfit = pnl.unrealized_profit_usd || 0;
       
-      // Base: Early entry + current unrealized profit
-      w.score = w.earlyBuys * 30 + w.currentUnrealizedBonus + unrealizedProfit;
+      // Base: Early + current unrealized (heavy weight)
+      w.score = w.earlyBuys * 40 + w.currentUnrealizedBonus + unrealizedProfit * 2;
       
       // Consistency boost (win rate ≥25%)
       if (winRate >= 0.25) {
-        w.score += winRate * 300 + profitableTrades * 20;
+        w.score += winRate * 400 + profitableTrades * 30;
       }
       
       // Realized profit bonus
-      w.score += realizedProfit / 10;
+      w.score += realizedProfit;
       
       // Emerging trader bonus: high current profit, low history
-      if (totalTrades < 5 && (w.currentUnrealizedBonus + unrealizedProfit) > 500) {
-        w.score += 200;
+      if (totalTrades < 5 && (w.currentUnrealizedBonus + unrealizedProfit) > 300) {
+        w.score += 300;
       }
       
       w.winRate = winRate;
@@ -338,8 +338,8 @@ app.get('/api/discover', async (req, res) => {
       discoveredWallets,
       totalCandidates: candidates.length,
       message: discoveredWallets.length === 0 
-        ? 'No early profitable traders found yet — market too early.'
-        : 'Early + in-profit traders with consistency scoring!'
+        ? 'No profitable traders found yet — market too early or no matches.'
+        : 'Profitable traders with early entry and consistency!'
     });
     
   } catch (error) {
@@ -348,7 +348,7 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// ANALYZE WALLET - Your existing code (keep as is)
+// ANALYZE WALLET - unchanged
 app.get('/api/wallet/:address', async (req, res) => {
   try {
     const { address } = req.params;
