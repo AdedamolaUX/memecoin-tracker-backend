@@ -83,6 +83,20 @@ async function getTokenMarketCap(address) {
   return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, liquidity: 0, age: null };
 }
 
+// Helper function to get tier info
+function getTierInfo(percentile) {
+  if (percentile >= 95) return { tier: 'LEGENDARY', emoji: '👑', color: '#FFD700' };
+  if (percentile >= 90) return { tier: 'ELITE', emoji: '💎', color: '#B9F2FF' };
+  if (percentile >= 80) return { tier: 'EXPERT', emoji: '⚡', color: '#9D4EDD' };
+  if (percentile >= 70) return { tier: 'ADVANCED', emoji: '🔥', color: '#FF6B35' };
+  if (percentile >= 60) return { tier: 'SKILLED', emoji: '⭐', color: '#F72585' };
+  if (percentile >= 50) return { tier: 'PROFICIENT', emoji: '📈', color: '#4361EE' };
+  if (percentile >= 40) return { tier: 'COMPETENT', emoji: '✓', color: '#06D6A0' };
+  if (percentile >= 30) return { tier: 'INTERMEDIATE', emoji: '↗', color: '#26C485' };
+  if (percentile >= 20) return { tier: 'DEVELOPING', emoji: '📊', color: '#90E0EF' };
+  return { tier: 'NOVICE', emoji: '🌱', color: '#ADB5BD' };
+}
+
 // ANALYZE WALLET
 app.get('/api/wallet/:address', async (req, res) => {
   try {
@@ -198,7 +212,7 @@ app.get('/api/wallet/:address', async (req, res) => {
   }
 });
 
-// DISCOVERY - Multi-source with adjustable filters
+// DISCOVERY - With Percentile Ranking & Tier Badges
 app.get('/api/discover', async (req, res) => {
   try {
     const tokenLimit = Math.min(parseInt(req.query.limit) || 50, 100);
@@ -253,7 +267,7 @@ app.get('/api/discover', async (req, res) => {
                 earlyBuys: 0,
                 totalTokens: 0,
                 totalChangeBonus: 0,
-                score: 0
+                rawScore: 0
               };
             }
             walletScores[wallet].earlyBuys += 1;
@@ -315,7 +329,7 @@ app.get('/api/discover', async (req, res) => {
                   earlyBuys: 0,
                   totalTokens: 0,
                   totalChangeBonus: 0,
-                  score: 0
+                  rawScore: 0
                 };
               }
               walletScores[wallet].totalTokens += 1;
@@ -333,38 +347,74 @@ app.get('/api/discover', async (req, res) => {
       console.error('Birdeye error:', err.message);
     }
     
-    // Calculate scores
+    // Calculate raw scores
     Object.values(walletScores).forEach(w => {
-      w.score = (w.earlyBuys * 10) + w.totalTokens + Math.floor(w.totalChangeBonus);
+      w.rawScore = (w.earlyBuys * 10) + w.totalTokens + Math.floor(w.totalChangeBonus);
     });
     
     // Apply filters
     let filteredWallets = Object.values(walletScores)
-      .filter(w => w.score >= minScore && w.earlyBuys >= minEarly);
+      .filter(w => w.rawScore >= minScore && w.earlyBuys >= minEarly);
     
-    // Sort and return top wallets
+    // Sort by raw score
+    filteredWallets.sort((a, b) => b.rawScore - a.rawScore);
+    
+    // Calculate percentile scores (0-100)
+    const maxScore = filteredWallets[0]?.rawScore || 1;
+    const minScoreVal = filteredWallets[filteredWallets.length - 1]?.rawScore || 0;
+    const scoreRange = maxScore - minScoreVal || 1;
+    
+    // Convert to final format with percentiles and tiers
     const discoveredWallets = filteredWallets
-      .sort((a, b) => b.score - a.score)
       .slice(0, topCount)
-      .map((w, i) => ({
-        rank: i + 1,
-        address: w.address,
-        successScore: w.score,
-        earlyBuys: w.earlyBuys,
-        totalTokensTraded: w.totalTokens,
-        positiveChangeBonus: Math.floor(w.totalChangeBonus)
-      }));
+      .map((w, i) => {
+        // Calculate percentile (0-100)
+        const percentile = Math.round(((w.rawScore - minScoreVal) / scoreRange) * 100);
+        const tierInfo = getTierInfo(percentile);
+        
+        return {
+          rank: i + 1,
+          address: w.address,
+          
+          // Percentile score (0-100)
+          successScore: percentile,
+          
+          // Tier information
+          tier: tierInfo.tier,
+          badge: tierInfo.emoji,
+          tierColor: tierInfo.color,
+          
+          // Raw metrics
+          earlyBuys: w.earlyBuys,
+          totalTokensTraded: w.totalTokens,
+          positiveChangeBonus: Math.floor(w.totalChangeBonus),
+          rawScore: w.rawScore
+        };
+      });
     
     console.log(`Discovery complete: ${discoveredWallets.length} wallets found`);
     
     res.json({
       success: true,
       discoveredWallets,
+      
+      // Summary stats
       totalWalletsBeforeFilter: Object.keys(walletScores).length,
       totalWalletsAfterFilter: filteredWallets.length,
       tokensAnalyzed,
+      
+      // Tier distribution
+      tierDistribution: {
+        legendary: discoveredWallets.filter(w => w.tier === 'LEGENDARY').length,
+        elite: discoveredWallets.filter(w => w.tier === 'ELITE').length,
+        expert: discoveredWallets.filter(w => w.tier === 'EXPERT').length,
+        advanced: discoveredWallets.filter(w => w.tier === 'ADVANCED').length,
+        skilled: discoveredWallets.filter(w => w.tier === 'SKILLED').length,
+        other: discoveredWallets.filter(w => !['LEGENDARY', 'ELITE', 'EXPERT', 'ADVANCED', 'SKILLED'].includes(w.tier)).length
+      },
+      
       appliedFilters: { tokenLimit, topCount, minScore, minEarly },
-      message: 'Use ?limit=100&top=50&minScore=0&minEarly=0 for maximum wallets',
+      message: 'Scores are 0-100 percentile. 👑=Top 5%, 💎=Top 10%, ⚡=Top 20%. Use ?limit=100&top=50 for more wallets',
       timestamp: new Date()
     });
     
@@ -389,11 +439,23 @@ app.get('/api/dexscreener/:address', async (req, res) => {
 // HOME
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'LOW CAP HUNTER API - Multi-Source Discovery',
+    status: 'LOW CAP HUNTER API - Multi-Source Discovery with Tier System',
     endpoints: {
       wallet: '/api/wallet/:address?maxMC=1000000&minRate=40&minTrades=3',
       discover: '/api/discover?limit=50&top=20&minScore=0&minEarly=0',
       dexscreener: '/api/dexscreener/:address'
+    },
+    tiers: {
+      legendary: '👑 95-100% (Top 5%)',
+      elite: '💎 90-95% (Top 10%)',
+      expert: '⚡ 80-90% (Top 20%)',
+      advanced: '🔥 70-80%',
+      skilled: '⭐ 60-70%',
+      proficient: '📈 50-60%',
+      competent: '✓ 40-50%',
+      intermediate: '↗ 30-40%',
+      developing: '📊 20-30%',
+      novice: '🌱 0-20%'
     },
     sources: ['DexScreener', 'Birdeye', 'Helius'],
     timestamp: new Date() 
