@@ -5,7 +5,7 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ALL KEYS ARE ENVIRONMENT VARIABLES - NO SECRETS IN CODE
+// ALL API KEYS ARE NOW LOADED FROM ENVIRONMENT VARIABLES (SAFE FOR GITHUB)
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
