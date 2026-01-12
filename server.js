@@ -74,24 +74,42 @@ async function getTokenMetadata(address) {
   return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
 }
 
-// Get market cap and change
-async function getTokenMarketCap(address) {
+// Get pair addresses from DexScreener (SOL/USDT)
+async function getPairAddresses(mint) {
   try {
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
+    const response = await fetch(url);
     const data = await response.json();
-    
-    if (data && data.pairs && data.pairs[0]) {
-      const pair = data.pairs[0];
-      return {
-        marketCap: pair.fdv || pair.marketCap || 0,
-        priceUsd: parseFloat(pair.priceUsd) || 0,
-        change24h: pair.priceChange?.h24 || 0,
-        volume24h: pair.volume?.h24 || 0,
-        age: pair.pairCreatedAt ? Date.now() - new Date(pair.pairCreatedAt).getTime() : null
-      };
+    if (data.pairs && data.pairs.length > 0) {
+      const solPair = data.pairs.find(p => p.quoteToken.symbol === 'SOL')?.pairAddress;
+      const usdtPair = data.pairs.find(p => p.quoteToken.symbol === 'USDT')?.pairAddress;
+      return [solPair, usdtPair].filter(p => p);
     }
-  } catch (err) {}
-  return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, age: null };
+  } catch (err) {
+    console.log('DexScreener pairs failed:', err.message);
+  }
+  return [];
+}
+
+// Dynamic institutional check
+async function isInstitutional(wallet) {
+  try {
+    const infoUrl = `https://api.helius.xyz/v0/addresses/${wallet}?api-key=${HELIUS_API_KEY}`;
+    const infoResponse = await fetch(infoUrl);
+    const infoData = await infoResponse.json();
+    
+    if (infoData.executable) return true;
+    
+    const balanceUrl = `https://api.helius.xyz/v0/addresses/${wallet}/balance?api-key=${HELIUS_API_KEY}`;
+    const balanceResponse = await fetch(balanceUrl);
+    const balanceData = await balanceResponse.json();
+    
+    if (balanceData && balanceData.balance > 500000 * 10**9) return true;
+    
+    return false;
+  } catch (err) {
+    return false;
+  }
 }
 
 // Get wallet balance in SOL
@@ -106,7 +124,7 @@ async function getWalletBalance(wallet) {
   }
 }
 
-// Get Moralis PnL
+// Get Moralis PnL (realized + unrealized)
 async function getWalletPnL(wallet) {
   try {
     const url = `https://solana-gateway.moralis.io/account/mainnet/${wallet}/pnl`;
@@ -143,7 +161,7 @@ async function getWalletPnL(wallet) {
   };
 }
 
-// MAIN DISCOVERY - With DexScreener Top Traders Scraping
+// MAIN DISCOVERY - With Pair Addresses + Apify Scraping
 app.get('/api/discover', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -165,29 +183,65 @@ app.get('/api/discover', async (req, res) => {
     
     const allTokens = [...newTokens.map(t => t.baseToken.address), ...trendingTokens.map(t => t.address)];
     
-    // Scrape top traders using Apify
-    for (const tokenAddress of allTokens) {
-      if (!APIFY_TOKEN) {
-        console.log('APIFY_TOKEN not set - skipping scraping');
-        continue;
-      }
+    // 1. Helius tx on Pair Addresses
+    for (const mint of allTokens) {
+      const pairAddresses = await getPairAddresses(mint);
       
+      for (const pairAddress of pairAddresses) {
+        try {
+          const txUrl = `https://api.helius.xyz/v0/addresses/${pairAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+          const txResponse = await fetch(txUrl);
+          const transactions = await txResponse.json();
+          
+          if (!transactions || transactions.length === 0) continue;
+          
+          const owners = new Set();
+          for (const tx of transactions) {
+            if (tx.tokenTransfers) {
+              for (const transfer of tx.tokenTransfers) {
+                if (transfer.fromOwnerAccount) owners.add(transfer.fromOwnerAccount.toLowerCase());
+                if (transfer.toOwnerAccount) owners.add(transfer.toOwnerAccount.toLowerCase());
+              }
+            }
+          }
+          
+          for (const owner of owners) {
+            if (BLACKLISTED_WALLETS.includes(owner)) continue;
+            if (await isInstitutional(owner)) continue;
+            
+            const balance = await getWalletBalance(owner);
+            if (balance < 0.001) continue; // Relaxed
+            
+            if (!traderScores[owner]) {
+              traderScores[owner] = {
+                address: owner,
+                earlyBuys: 0,
+                score: 0
+              };
+            }
+            traderScores[owner].earlyBuys += 1;
+          }
+          
+          await new Promise(r => setTimeout(r, 500));
+        } catch (err) {
+          console.log('Helius failed for pair:', err.message);
+        }
+      }
+    }
+    
+    // 2. Apify Scraping for Top Traders
+    for (const tokenAddress of allTokens) {
       try {
-        // Start sync run
-        const runUrl = `https://api.apify.com/v2/acts/crypto-scraper~dexscreener-top-traders-scraper/run-sync-get-dataset-items?token=${APIFY_TOKEN}`;
+        const runUrl = 'https://api.apify.com/v2/acts/crypto-scraper~dexscreener-top-traders-scraper/run-sync-get-dataset-items?token=' + APIFY_TOKEN;
         const runResponse = await fetch(runUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            tokens: [{ chain: 'solana', address: tokenAddress }],
+            tokenAddress: tokenAddress,
+            chain: 'solana',
             limit: 20
           })
         });
-        
-        if (!runResponse.ok) {
-          console.log('Apify run failed:', await runResponse.text());
-          continue;
-        }
         
         const traders = await runResponse.json();
         
@@ -195,9 +249,10 @@ app.get('/api/discover', async (req, res) => {
           const wallet = trader.wallet.toLowerCase();
           
           if (BLACKLISTED_WALLETS.includes(wallet)) continue;
+          if (await isInstitutional(wallet)) continue;
           
           const balance = await getWalletBalance(wallet);
-          if (balance < 0.01) continue;
+          if (balance < 0.001) continue;
           
           const pnl = await getWalletPnL(wallet);
           
@@ -216,13 +271,13 @@ app.get('/api/discover', async (req, res) => {
           traderScores[wallet].recentUnrealizedUSD += (trader.unrealizedPnl || 0);
         }
         
-        await new Promise(r => setTimeout(r, 1200)); // Rate limit
+        await new Promise(r => setTimeout(r, 1000));
       } catch (err) {
-        console.log('Scraping error for token', tokenAddress, err.message);
+        console.log('Apify scrape failed:', err.message);
       }
     }
     
-    // Final scoring
+    // Final scoring (relaxed)
     Object.values(traderScores).forEach(t => {
       const recentTotal = t.recentProfitUSD + t.recentUnrealizedUSD;
       t.score = recentTotal + 
@@ -246,10 +301,10 @@ app.get('/api/discover', async (req, res) => {
     res.json({
       success: true,
       discoveredWallets,
-      totalTokensScraped: allTokens.length,
+      totalTokensProcessed: allTokens.length,
       message: discoveredWallets.length === 0 
-        ? 'No top traders found in current tokens — try again in a few minutes.'
-        : 'Top traders scraped from DexScreener with skill validation!'
+        ? 'No top traders found in current tokens — try again soon!'
+        : 'Top traders from DexScreener with skill validation!'
     });
     
   } catch (error) {
@@ -258,19 +313,129 @@ app.get('/api/discover', async (req, res) => {
   }
 });
 
-// ANALYZE WALLET (unchanged)
-app.get('/api/wallet/:address', async (req, res) => {
-  // Your existing code
-});
-
-// DEXSCREENER
-app.get('/api/dexscreener/:address', async (req, res) => {
+// JUPITER SWAP QUOTE - New Endpoint
+app.get('/api/swap-quote', async (req, res) => {
   try {
-    const { address } = req.params;
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+    const { inputMint, outputMint, amount, slippageBps = 50 } = req.query;
+    
+    if (!inputMint || !outputMint || !amount) {
+      return res.status(400).json({ error: 'Missing inputMint, outputMint, or amount' });
+    }
+    
+    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
+    const response = await fetch(url);
     const data = await response.json();
+    
     res.json(data);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ANALYZE WALLET (unchanged)
+app.get('/api/wallet/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+    
+    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
+    const minSuccessRate = parseInt(req.query.minRate) || 40;
+    const minLowCapTrades = parseInt(req.query.minTrades) || 3;
+    
+    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
+    const response = await fetch(url);
+    const transactions = await response.json();
+    
+    if (!transactions || transactions.length === 0) {
+      return res.json({
+        address,
+        isEarlyEntrySpecialist: false,
+        lowCapEntries: 0,
+        totalTrades: 0,
+        earlyEntryRate: 0,
+        successfulLowCapExits: 0,
+        filters: { maxMarketCap, minSuccessRate, minLowCapTrades },
+        error: 'No transactions found'
+      });
+    }
+    
+    const swaps = transactions.filter(tx => 
+      tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
+    );
+    
+    const tokenSet = new Set();
+    const tokenEntries = {};
+    
+    for (const tx of swaps) {
+      if (tx.tokenTransfers) {
+        for (const transfer of tx.tokenTransfers) {
+          if (transfer.mint && transfer.mint !== 'So11111111111111111111111111111111111111112') {
+            tokenSet.add(transfer.mint);
+            if (!tokenEntries[transfer.mint]) {
+              tokenEntries[transfer.mint] = { firstSeen: tx.timestamp };
+            }
+          }
+        }
+      }
+    }
+    
+    let lowCapEntries = 0;
+    let successfulLowCapTrades = 0;
+    const analyzedTokens = [];
+    
+    const recentTokens = Array.from(tokenSet).slice(0, 5);
+    
+    for (const tokenAddr of recentTokens) {
+      const metadata = await getTokenMetadata(tokenAddr);
+      const mcData = await getTokenMarketCap(tokenAddr);
+      
+      const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
+      const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
+      
+      if (meetsLowCapCriteria || isVeryNew) {
+        lowCapEntries++;
+        if (mcData.marketCap > maxMarketCap * 10) {
+          successfulLowCapTrades++;
+        }
+      }
+      
+      analyzedTokens.push({
+        address: tokenAddr,
+        symbol: metadata.symbol,
+        name: metadata.name,
+        currentMC: mcData.marketCap,
+        meetsFilter: meetsLowCapCriteria,
+        isNew: isVeryNew,
+        firstTradedBy: new Date(tokenEntries[tokenAddr].firstSeen * 1000).toISOString()
+      });
+      
+      await new Promise(r => setTimeout(r, 300));
+    }
+    
+    const earlyEntryRate = swaps.length > 0 ? Math.floor((lowCapEntries / Math.min(swaps.length, 20)) * 100) : 0;
+    const isSpecialist = lowCapEntries >= minLowCapTrades && earlyEntryRate >= minSuccessRate;
+    
+    const analysis = {
+      address,
+      isEarlyEntrySpecialist: isSpecialist,
+      lowCapEntries: lowCapEntries,
+      totalTrades: swaps.length,
+      earlyEntryRate: earlyEntryRate,
+      successfulLowCapExits: successfulLowCapTrades,
+      score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
+      analyzedTokens: analyzedTokens,
+      lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
+      specialistBadge: isSpecialist ? 'EARLY ENTRY SPECIALIST' : null,
+      filters: {
+        maxMarketCap,
+        minSuccessRate,
+        minLowCapTrades
+      }
+    };
+    
+    res.json(analysis);
+    
+  } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -281,11 +446,12 @@ app.get('/', (req, res) => {
     status: 'Memecoin Tracker Backend is LIVE!',
     timestamp: new Date().toISOString(),
     uptime_seconds: Math.floor(process.uptime()),
-    message: 'Top traders scraped from DexScreener + skill validation',
+    message: 'Your successful trader discovery API is ready.',
     endpoints: {
       discover: '/api/discover?limit=50 (main feature - ranked traders)',
       wallet: '/api/wallet/WALLET_ADDRESS (detailed analysis)',
-      dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)'
+      dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)',
+      swap-quote: '/api/swap-quote?inputMint=So11111111111111111111111111111111111111112&outputMint=DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263&amount=1000000000 (Jupiter swap quote)'
     }
   });
 });
