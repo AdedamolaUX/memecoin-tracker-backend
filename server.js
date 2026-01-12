@@ -5,7 +5,7 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ALL KEYS FROM ENVIRONMENT VARIABLES (NO HARD-CODED SECRETS)
+// ALL KEYS FROM ENVIRONMENT VARIABLES
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
@@ -13,7 +13,7 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
 
 let tokenCache = {};
 
-// Blacklist for institutions/bots
+// Blacklist
 const BLACKLISTED_WALLETS = [
   'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4',
   '675kpx9mhtjs2zt1qfr1nyhuzelxfqm9h24wfsut1nds',
@@ -161,7 +161,7 @@ async function getWalletPnL(wallet) {
   };
 }
 
-// MAIN DISCOVERY - Pair Addresses + Apify Scraping + Relaxed Filters
+// MAIN DISCOVERY - Pair Addresses + Apify Scraping
 app.get('/api/discover', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -193,7 +193,10 @@ app.get('/api/discover', async (req, res) => {
           const txResponse = await fetch(txUrl);
           const transactions = await txResponse.json();
           
-          if (!transactions || transactions.length === 0) continue;
+          if (!transactions || transactions.length === 0) {
+            console.log('No txs for pair:', pairAddress);
+            continue;
+          }
           
           const owners = new Set();
           for (const tx of transactions) {
@@ -205,12 +208,14 @@ app.get('/api/discover', async (req, res) => {
             }
           }
           
+          console.log('Found owners for pair', pairAddress, ':', owners.size);
+          
           for (const owner of owners) {
             if (BLACKLISTED_WALLETS.includes(owner)) continue;
             if (await isInstitutional(owner)) continue;
             
             const balance = await getWalletBalance(owner);
-            if (balance < 0.001) continue; // Relaxed
+            if (balance < 0.001) continue;
             
             if (!traderScores[owner]) {
               traderScores[owner] = {
@@ -224,7 +229,7 @@ app.get('/api/discover', async (req, res) => {
           
           await new Promise(r => setTimeout(r, 500));
         } catch (err) {
-          console.log('Helius failed for pair:', err.message);
+          console.log('Helius failed for pair', pairAddress, ':', err.message);
         }
       }
     }
@@ -249,6 +254,8 @@ app.get('/api/discover', async (req, res) => {
         }
         
         const traders = await runResponse.json();
+        
+        console.log('Apify traders for token', tokenAddress, ':', traders.length);
         
         for (const trader of traders) {
           const wallet = trader.wallet.toLowerCase();
@@ -278,7 +285,7 @@ app.get('/api/discover', async (req, res) => {
         
         await new Promise(r => setTimeout(r, 1000));
       } catch (err) {
-        console.log('Apify scrape failed for token', tokenAddress, err.message);
+        console.log('Apify scrape failed for token', tokenAddress, ':', err.message);
       }
     }
     
