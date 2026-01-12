@@ -5,7 +5,7 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ALL KEYS FROM ENVIRONMENT VARIABLES
+// ALL KEYS FROM ENVIRONMENT VARIABLES (NO HARD-CODED SECRETS)
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || '';
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
@@ -13,7 +13,7 @@ const APIFY_TOKEN = process.env.APIFY_TOKEN || '';
 
 let tokenCache = {};
 
-// Blacklist
+// Blacklist for institutions/bots
 const BLACKLISTED_WALLETS = [
   'jup6lkbzbjs1jkkwapdhny74zcz3tluzoi5qnyvtav4',
   '675kpx9mhtjs2zt1qfr1nyhuzelxfqm9h24wfsut1nds',
@@ -161,7 +161,7 @@ async function getWalletPnL(wallet) {
   };
 }
 
-// MAIN DISCOVERY - With Pair Addresses + Apify Scraping
+// MAIN DISCOVERY - Pair Addresses + Apify Scraping + Relaxed Filters
 app.get('/api/discover', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
@@ -183,7 +183,7 @@ app.get('/api/discover', async (req, res) => {
     
     const allTokens = [...newTokens.map(t => t.baseToken.address), ...trendingTokens.map(t => t.address)];
     
-    // 1. Helius tx on Pair Addresses
+    // 1. Helius tx on Pair Addresses (SOL/USDT)
     for (const mint of allTokens) {
       const pairAddresses = await getPairAddresses(mint);
       
@@ -243,6 +243,11 @@ app.get('/api/discover', async (req, res) => {
           })
         });
         
+        if (!runResponse.ok) {
+          console.log('Apify run failed:', await runResponse.text());
+          continue;
+        }
+        
         const traders = await runResponse.json();
         
         for (const trader of traders) {
@@ -273,7 +278,7 @@ app.get('/api/discover', async (req, res) => {
         
         await new Promise(r => setTimeout(r, 1000));
       } catch (err) {
-        console.log('Apify scrape failed:', err.message);
+        console.log('Apify scrape failed for token', tokenAddress, err.message);
       }
     }
     
@@ -303,8 +308,8 @@ app.get('/api/discover', async (req, res) => {
       discoveredWallets,
       totalTokensProcessed: allTokens.length,
       message: discoveredWallets.length === 0 
-        ? 'No top traders found in current tokens — try again soon!'
-        : 'Top traders from DexScreener with skill validation!'
+        ? 'No top traders found in current tokens — try again in a few minutes.'
+        : 'Top traders scraped from DexScreener with skill validation!'
     });
     
   } catch (error) {
@@ -451,7 +456,7 @@ app.get('/', (req, res) => {
       discover: '/api/discover?limit=50 (main feature - ranked traders)',
       wallet: '/api/wallet/WALLET_ADDRESS (detailed analysis)',
       dexscreener: '/api/dexscreener/TOKEN_ADDRESS (token data)',
-      swap-quote: '/api/swap-quote?inputMint=So11111111111111111111111111111111111111112&outputMint=DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263&amount=1000000000 (Jupiter swap quote)'
+      'swap-quote': '/api/swap-quote?inputMint=So11111111111111111111111111111111111111112&outputMint=DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263&amount=1000000000 (Jupiter swap quote)'
     }
   });
 });
