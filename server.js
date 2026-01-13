@@ -13,6 +13,66 @@ const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
 
+// BLACKLIST: Known institutional wallets and DEX contracts
+const BLACKLISTED_WALLETS = new Set([
+  // Jupiter Aggregator
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
+  
+  // Raydium
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  '5Q544fKrFoe6tsEbD7S8EmEunGAV1gnGo',
+  
+  // Orca
+  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+  
+  // OKX
+  'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtL',
+  
+  // Binance
+  'GJRs4FRmzQ4G1hPqD1ZBNkq3FHhT4JNSB6pvPEKsxz',
+  '2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S',
+  
+  // Pump.fun program
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  
+  // Known bot addresses (add more as you find them)
+  'BQ2NZhb4zJq5eJgzTt8HiXXJYAKKYgLnVcWVSN7LMG4s',
+  '5tzFkiKscXHK5ZXCGbeyPaFsqX4RZCNfxMqGdqPfFv1',
+]);
+
+// BOT DETECTION: Check if wallet behaves like a bot
+function isLikelyBot(walletData) {
+  // Too many trades (high frequency)
+  if (walletData.totalTokens > 50) return true;
+  
+  // Only trades one token (likely sniper bot)
+  if (walletData.totalTokens === 1 && walletData.tokensFound.length === 1) return true;
+  
+  // All trades are in first position (bot sniper)
+  const allFirstPosition = walletData.tokensFound.every(t => t.position <= 3);
+  if (allFirstPosition && walletData.tokensFound.length > 3) return true;
+  
+  // Very recent wallet (created just to snipe)
+  const daysSinceActive = (Date.now() / 1000 - walletData.lastActivity) / 86400;
+  if (daysSinceActive < 1 && walletData.totalTokens > 10) return true;
+  
+  return false;
+}
+
+// Check if address looks like a program/contract
+function isProgramAddress(address) {
+  // Solana programs typically end in specific patterns
+  // This is a heuristic - not perfect but helps
+  const programPatterns = [
+    /pump$/i,     // pump.fun contracts
+    /111111/,     // System program patterns
+    /AToken/,     // Associated token patterns
+  ];
+  
+  return programPatterns.some(pattern => pattern.test(address));
+}
+
 async function loadTokenRegistry() {
   try {
     const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
@@ -106,7 +166,6 @@ app.get('/api/wallet/:address', async (req, res) => {
     const response = await fetch(url);
     const transactions = await response.json();
     
-    // CHECK if response is an error
     if (!Array.isArray(transactions)) {
       console.error('Helius error:', transactions);
       return res.json({
@@ -206,17 +265,18 @@ app.get('/api/wallet/:address', async (req, res) => {
 
 app.get('/api/discover', async (req, res) => {
   try {
-    const tokenLimit = Math.min(parseInt(req.query.limit) || 20, 50); // REDUCED to avoid rate limits
+    const tokenLimit = Math.min(parseInt(req.query.limit) || 20, 50);
     const topCount = Math.min(parseInt(req.query.top) || 20, 50);
     const minScore = parseInt(req.query.minScore) || 0;
 
     console.log('=== DISCOVERY START ===');
-    console.log('Params:', { tokenLimit, topCount, minScore });
 
     const walletScores = {};
     const tokenData = {};
     let tokensAnalyzed = 0;
     let heliusErrors = 0;
+    let filteredOutBots = 0;
+    let filteredOutInstitutional = 0;
     
     console.log('Fetching DexScreener tokens...');
     try {
@@ -247,19 +307,14 @@ app.get('/api/discover', async (req, res) => {
           const txResponse = await fetch(txUrl);
           const transactions = await txResponse.json();
           
-          // CRITICAL FIX: Check if response is an array
           if (!Array.isArray(transactions)) {
-            console.log(`${token.baseToken.symbol}: Helius error -`, transactions.error || 'Not an array');
+            console.log(`${token.baseToken.symbol}: Helius error`);
             heliusErrors++;
             continue;
           }
           
-          if (transactions.length === 0) {
-            console.log(`${token.baseToken.symbol}: No transactions`);
-            continue;
-          }
+          if (transactions.length === 0) continue;
           
-          console.log(`${token.baseToken.symbol}: ${transactions.length} transactions ✓`);
           tokensAnalyzed++;
           
           const buyerTimestamps = new Map();
@@ -270,6 +325,19 @@ app.get('/api/discover', async (req, res) => {
               for (const transfer of tx.tokenTransfers) {
                 if (transfer.mint === mintAddress && transfer.toUserAccount) {
                   const wallet = transfer.toUserAccount;
+                  
+                  // FILTER: Skip blacklisted wallets
+                  if (BLACKLISTED_WALLETS.has(wallet)) {
+                    filteredOutInstitutional++;
+                    continue;
+                  }
+                  
+                  // FILTER: Skip program addresses
+                  if (isProgramAddress(wallet)) {
+                    filteredOutInstitutional++;
+                    continue;
+                  }
+                  
                   totalBuyers.add(wallet);
                   
                   if (!buyerTimestamps.has(wallet)) {
@@ -279,8 +347,6 @@ app.get('/api/discover', async (req, res) => {
               }
             }
           }
-          
-          console.log(`${token.baseToken.symbol}: Found ${totalBuyers.size} buyers`);
           
           const sortedBuyers = Array.from(buyerTimestamps.entries()).sort((a, b) => a[1] - b[1]);
           const totalBuyerCount = sortedBuyers.length;
@@ -338,7 +404,6 @@ app.get('/api/discover', async (req, res) => {
             });
           });
           
-          // Longer delay to avoid rate limits
           await new Promise(r => setTimeout(r, 1000));
         } catch (err) {
           console.error(`Error processing ${token.baseToken.symbol}:`, err.message);
@@ -349,8 +414,8 @@ app.get('/api/discover', async (req, res) => {
       console.error('DexScreener error:', err.message);
     }
     
-    console.log(`Scanned wallets: ${Object.keys(walletScores).length}`);
-    console.log(`Helius errors: ${heliusErrors}`);
+    console.log(`Total wallets before filtering: ${Object.keys(walletScores).length}`);
+    console.log(`Filtered institutional: ${filteredOutInstitutional}`);
     
     const now = Date.now() / 1000;
     Object.values(walletScores).forEach(w => {
@@ -374,20 +439,31 @@ app.get('/api/discover', async (req, res) => {
         (w.recencyScore * 0.1);
     });
     
-    console.log('Before filtering:', Object.keys(walletScores).length, 'wallets');
-    
     let filteredWallets = Object.values(walletScores).filter(w => {
-      if (w.totalTokens > 100) return false;
-      if (w.totalTokens < 1) return false;
+      // FILTER: Remove bots
+      if (isLikelyBot(w)) {
+        filteredOutBots++;
+        return false;
+      }
       
+      // FILTER: Too many tokens (likely bot)
+      if (w.totalTokens > 50) return false;
+      
+      // FILTER: Require minimum activity
+      if (w.totalTokens < 2) return false;
+      
+      // FILTER: Recent activity
       const daysSinceActive = (now - w.lastActivity) / 86400;
       if (daysSinceActive > 90) return false;
+      
+      // FILTER: Minimum score
       if (w.totalScore < minScore) return false;
       
       return true;
     });
     
-    console.log('After filtering:', filteredWallets.length, 'wallets');
+    console.log(`Filtered out ${filteredOutBots} bots`);
+    console.log(`Remaining wallets: ${filteredWallets.length}`);
     
     filteredWallets.sort((a, b) => b.totalScore - a.totalScore);
     
@@ -421,7 +497,6 @@ app.get('/api/discover', async (req, res) => {
       });
     
     console.log('=== DISCOVERY COMPLETE ===');
-    console.log(`Returning ${discoveredWallets.length} wallets`);
     
     res.json({
       success: true,
@@ -431,6 +506,8 @@ app.get('/api/discover', async (req, res) => {
         walletsAfterFilters: filteredWallets.length,
         tokensAnalyzed,
         heliusErrors,
+        filteredInstitutional: filteredOutInstitutional,
+        filteredBots: filteredOutBots,
         averageScore: discoveredWallets.length > 0 ? Math.round(discoveredWallets.reduce((sum, w) => sum + w.totalScore, 0) / discoveredWallets.length) : 0
       },
       tierDistribution: {
@@ -451,9 +528,9 @@ app.get('/api/discover', async (req, res) => {
         tokenLimit,
         topCount,
         minScore,
-        removedBots: 'Wallets with >100 trades removed',
-        removedInactive: 'Wallets inactive >90 days removed',
-        minTokens: 'Minimum 1 token required'
+        blacklistedWallets: BLACKLISTED_WALLETS.size,
+        botDetection: 'Enabled',
+        minTokens: 'Minimum 2 different tokens required'
       },
       timestamp: new Date()
     });
@@ -477,14 +554,18 @@ app.get('/api/dexscreener/:address', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'LOW CAP HUNTER API - Fixed',
-    version: '2.1',
+    status: 'LOW CAP HUNTER API - Bot Filtered',
+    version: '2.2',
     endpoints: {
       wallet: '/api/wallet/:address',
       discover: '/api/discover?limit=20&top=20',
       dexscreener: '/api/dexscreener/:address'
     },
-    note: 'Reduced default limit to 20 to avoid Helius rate limits',
+    features: {
+      blacklist: `${BLACKLISTED_WALLETS.size} institutional wallets blocked`,
+      botDetection: 'High-frequency traders filtered',
+      qualityFilters: 'Min 2 tokens, active in 90 days'
+    },
     timestamp: new Date() 
   });
 });
@@ -492,5 +573,5 @@ app.get('/', (req, res) => {
 loadTokenRegistry();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('LOW CAP HUNTER API v2.1 running on port', PORT);
+  console.log('LOW CAP HUNTER API v2.2 - Bot Filtered running on port', PORT);
 });
