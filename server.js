@@ -13,61 +13,123 @@ const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 
 let tokenCache = {};
 
-// BLACKLIST: Known institutional wallets and DEX contracts
+// EXPANDED BLACKLIST
 const BLACKLISTED_WALLETS = new Set([
-  // Jupiter Aggregator
+  // Jupiter
   'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
   'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
+  'JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL2uJvfo',
   
   // Raydium
   '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
   '5Q544fKrFoe6tsEbD7S8EmEunGAV1gnGo',
+  'RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr',
   
   // Orca
   'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
   
   // OKX
   'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtL',
+  '5VCwKtCXgCJ6kit5FybXjvriW3xELsFDhYrPSqtJNmcD',
   
   // Binance
   'GJRs4FRmzQ4G1hPqD1ZBNkq3FHhT4JNSB6pvPEKsxz',
   '2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S',
   
-  // Pump.fun program
-  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  // Phantom (fee collector)
+  'GUfCR9mK6azb9vcpsxgXyj7XRPAKJd4KMHTTVvtncGgp',
   
-  // Known bot addresses (add more as you find them)
-  'BQ2NZhb4zJq5eJgzTt8HiXXJYAKKYgLnVcWVSN7LMG4s',
-  '5tzFkiKscXHK5ZXCGbeyPaFsqX4RZCNfxMqGdqPfFv1',
+  // Pump.fun
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+  'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM',
+  
+  // Titan Exchange
+  'TitanZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ',
 ]);
 
-// BOT DETECTION: Check if wallet behaves like a bot
+// Enhanced bot detection with profit checking
+async function analyzeWalletProfitability(walletData, walletAddress) {
+  try {
+    // Get wallet's full transaction history
+    const txUrl = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+    const txResponse = await fetch(txUrl);
+    const transactions = await txResponse.json();
+    
+    if (!Array.isArray(transactions) || transactions.length === 0) {
+      return { isProfitable: false, estimatedProfit: 0, reason: 'No transaction data' };
+    }
+    
+    let totalSOLIn = 0;
+    let totalSOLOut = 0;
+    let tradeCount = 0;
+    
+    for (const tx of transactions) {
+      if (tx.type === 'SWAP' && tx.tokenTransfers) {
+        tradeCount++;
+        
+        // Look for SOL transfers (native transfers)
+        if (tx.nativeTransfers) {
+          for (const transfer of tx.nativeTransfers) {
+            const amount = transfer.amount / 1e9; // Convert lamports to SOL
+            
+            if (transfer.fromUserAccount === walletAddress) {
+              totalSOLIn += amount;
+            }
+            if (transfer.toUserAccount === walletAddress) {
+              totalSOLOut += amount;
+            }
+          }
+        }
+      }
+    }
+    
+    const netProfit = totalSOLOut - totalSOLIn;
+    const profitMargin = totalSOLIn > 0 ? (netProfit / totalSOLIn) * 100 : 0;
+    
+    // FILTER CRITERIA:
+    // - Must have net profit > 0.1 SOL (real traders make money)
+    // - OR profit margin > 20% (even small traders aim for good returns)
+    // - Routers/bots typically have <1% margin
+    
+    if (netProfit < 0.1 && profitMargin < 20) {
+      return { 
+        isProfitable: false, 
+        estimatedProfit: netProfit,
+        profitMargin: profitMargin,
+        reason: 'Low profit margin - likely router/bot'
+      };
+    }
+    
+    return { 
+      isProfitable: true, 
+      estimatedProfit: netProfit,
+      profitMargin: profitMargin,
+      tradeCount
+    };
+    
+  } catch (err) {
+    console.error('Error analyzing profitability:', err.message);
+    return { isProfitable: false, estimatedProfit: 0, reason: 'Analysis error' };
+  }
+}
+
 function isLikelyBot(walletData) {
   // Too many trades (high frequency)
   if (walletData.totalTokens > 50) return true;
   
-  // Only trades one token (likely sniper bot)
-  if (walletData.totalTokens === 1 && walletData.tokensFound.length === 1) return true;
-  
-  // All trades are in first position (bot sniper)
-  const allFirstPosition = walletData.tokensFound.every(t => t.position <= 3);
-  if (allFirstPosition && walletData.tokensFound.length > 3) return true;
-  
-  // Very recent wallet (created just to snipe)
+  // Very recent wallet with high activity
   const daysSinceActive = (Date.now() / 1000 - walletData.lastActivity) / 86400;
   if (daysSinceActive < 1 && walletData.totalTokens > 10) return true;
   
   return false;
 }
 
-// Check if address looks like a program/contract
 function isProgramAddress(address) {
-  // Solana programs typically end in specific patterns
-  // This is a heuristic - not perfect but helps
   const programPatterns = [
-    /pump$/i,     // pump.fun contracts
-    /111111/,     // System program patterns
-    /AToken/,     // Associated token patterns
+    /pump$/i,
+    /111111/,
+    /AToken/,
+    /ZZZZ/i,  // Common in program addresses
   ];
   
   return programPatterns.some(pattern => pattern.test(address));
@@ -167,10 +229,9 @@ app.get('/api/wallet/:address', async (req, res) => {
     const transactions = await response.json();
     
     if (!Array.isArray(transactions)) {
-      console.error('Helius error:', transactions);
       return res.json({
         address,
-        error: 'Failed to fetch transactions from Helius: ' + (transactions.error || 'Unknown error')
+        error: 'Failed to fetch transactions: ' + (transactions.error || 'Unknown error')
       });
     }
     
@@ -178,11 +239,6 @@ app.get('/api/wallet/:address', async (req, res) => {
       return res.json({
         address,
         isEarlyEntrySpecialist: false,
-        lowCapEntries: 0,
-        totalTrades: 0,
-        earlyEntryRate: 0,
-        successfulLowCapExits: 0,
-        filters: { maxMarketCap, minSuccessRate, minLowCapTrades },
         error: 'No transactions found'
       });
     }
@@ -265,11 +321,11 @@ app.get('/api/wallet/:address', async (req, res) => {
 
 app.get('/api/discover', async (req, res) => {
   try {
-    const tokenLimit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const tokenLimit = Math.min(parseInt(req.query.limit) || 15, 30); // Reduced to speed up
     const topCount = Math.min(parseInt(req.query.top) || 20, 50);
     const minScore = parseInt(req.query.minScore) || 0;
 
-    console.log('=== DISCOVERY START ===');
+    console.log('=== DISCOVERY START (WITH PROFIT FILTERING) ===');
 
     const walletScores = {};
     const tokenData = {};
@@ -277,6 +333,7 @@ app.get('/api/discover', async (req, res) => {
     let heliusErrors = 0;
     let filteredOutBots = 0;
     let filteredOutInstitutional = 0;
+    let filteredOutLowProfit = 0;
     
     console.log('Fetching DexScreener tokens...');
     try {
@@ -308,7 +365,6 @@ app.get('/api/discover', async (req, res) => {
           const transactions = await txResponse.json();
           
           if (!Array.isArray(transactions)) {
-            console.log(`${token.baseToken.symbol}: Helius error`);
             heliusErrors++;
             continue;
           }
@@ -326,13 +382,13 @@ app.get('/api/discover', async (req, res) => {
                 if (transfer.mint === mintAddress && transfer.toUserAccount) {
                   const wallet = transfer.toUserAccount;
                   
-                  // FILTER: Skip blacklisted wallets
+                  // Skip blacklisted
                   if (BLACKLISTED_WALLETS.has(wallet)) {
                     filteredOutInstitutional++;
                     continue;
                   }
                   
-                  // FILTER: Skip program addresses
+                  // Skip program addresses
                   if (isProgramAddress(wallet)) {
                     filteredOutInstitutional++;
                     continue;
@@ -415,7 +471,6 @@ app.get('/api/discover', async (req, res) => {
     }
     
     console.log(`Total wallets before filtering: ${Object.keys(walletScores).length}`);
-    console.log(`Filtered institutional: ${filteredOutInstitutional}`);
     
     const now = Date.now() / 1000;
     Object.values(walletScores).forEach(w => {
@@ -439,39 +494,57 @@ app.get('/api/discover', async (req, res) => {
         (w.recencyScore * 0.1);
     });
     
-    let filteredWallets = Object.values(walletScores).filter(w => {
-      // FILTER: Remove bots
-      if (isLikelyBot(w)) {
+    // PROFIT ANALYSIS - Check top wallets for profitability
+    console.log('Analyzing wallet profitability...');
+    const walletsToCheck = Object.values(walletScores)
+      .sort((a, b) => b.totalScore - a.totalScore)
+      .slice(0, 50); // Check top 50 candidates
+    
+    const profitableWallets = [];
+    
+    for (const wallet of walletsToCheck) {
+      // Skip obvious bots first
+      if (isLikelyBot(wallet)) {
         filteredOutBots++;
-        return false;
+        continue;
       }
       
-      // FILTER: Too many tokens (likely bot)
-      if (w.totalTokens > 50) return false;
+      if (wallet.totalTokens < 2) continue;
       
-      // FILTER: Require minimum activity
-      if (w.totalTokens < 2) return false;
+      const daysSinceActive = (now - wallet.lastActivity) / 86400;
+      if (daysSinceActive > 90) continue;
       
-      // FILTER: Recent activity
-      const daysSinceActive = (now - w.lastActivity) / 86400;
-      if (daysSinceActive > 90) return false;
+      // PROFIT CHECK
+      const profitAnalysis = await analyzeWalletProfitability(wallet, wallet.address);
       
-      // FILTER: Minimum score
-      if (w.totalScore < minScore) return false;
+      if (!profitAnalysis.isProfitable) {
+        filteredOutLowProfit++;
+        console.log(`Filtered ${wallet.address.slice(0, 8)}: ${profitAnalysis.reason}`);
+        continue;
+      }
       
-      return true;
-    });
+      // Add profit data to wallet
+      wallet.estimatedProfit = profitAnalysis.estimatedProfit;
+      wallet.profitMargin = profitAnalysis.profitMargin;
+      
+      profitableWallets.push(wallet);
+      
+      // Slow down to avoid rate limits
+      await new Promise(r => setTimeout(r, 800));
+      
+      if (profitableWallets.length >= topCount) break;
+    }
     
-    console.log(`Filtered out ${filteredOutBots} bots`);
-    console.log(`Remaining wallets: ${filteredWallets.length}`);
+    console.log(`Found ${profitableWallets.length} profitable wallets`);
+    console.log(`Filtered: ${filteredOutLowProfit} low-profit, ${filteredOutBots} bots, ${filteredOutInstitutional} institutional`);
     
-    filteredWallets.sort((a, b) => b.totalScore - a.totalScore);
+    profitableWallets.sort((a, b) => b.totalScore - a.totalScore);
     
-    const maxScore = filteredWallets[0]?.totalScore || 1;
-    const minScoreVal = filteredWallets[filteredWallets.length - 1]?.totalScore || 0;
+    const maxScore = profitableWallets[0]?.totalScore || 1;
+    const minScoreVal = profitableWallets[profitableWallets.length - 1]?.totalScore || 0;
     const scoreRange = maxScore - minScoreVal || 1;
     
-    const discoveredWallets = filteredWallets
+    const discoveredWallets = profitableWallets
       .slice(0, topCount)
       .map((w, i) => {
         const percentile = Math.round(((w.totalScore - minScoreVal) / scoreRange) * 100);
@@ -485,6 +558,11 @@ app.get('/api/discover', async (req, res) => {
           tier: tierInfo.tier,
           badge: tierInfo.emoji,
           tierColor: tierInfo.color,
+          
+          // Profit metrics
+          estimatedProfit: w.estimatedProfit?.toFixed(2) || 0,
+          profitMargin: w.profitMargin?.toFixed(1) || 0,
+          
           earlyEntryScore: Math.round(w.earlyEntryScore),
           successRateScore: Math.round(w.successScore),
           consistencyScore: Math.round(w.consistencyScore),
@@ -503,11 +581,13 @@ app.get('/api/discover', async (req, res) => {
       discoveredWallets,
       stats: {
         totalWalletsScanned: Object.keys(walletScores).length,
-        walletsAfterFilters: filteredWallets.length,
+        walletsCheckedForProfit: walletsToCheck.length,
+        profitableWallets: profitableWallets.length,
         tokensAnalyzed,
         heliusErrors,
         filteredInstitutional: filteredOutInstitutional,
         filteredBots: filteredOutBots,
+        filteredLowProfit: filteredOutLowProfit,
         averageScore: discoveredWallets.length > 0 ? Math.round(discoveredWallets.reduce((sum, w) => sum + w.totalScore, 0) / discoveredWallets.length) : 0
       },
       tierDistribution: {
@@ -519,18 +599,19 @@ app.get('/api/discover', async (req, res) => {
         other: discoveredWallets.filter(w => !['LEGENDARY', 'ELITE', 'EXPERT', 'ADVANCED', 'SKILLED'].includes(w.tier)).length
       },
       scoringBreakdown: {
-        earlyEntry: '40% - Position in buy order (top 5% = 10pts)',
-        successRate: '30% - Did tokens pump after entry',
-        consistency: '20% - Number of different tokens',
-        recency: '10% - How recently active'
+        earlyEntry: '40% - Position in buy order',
+        successRate: '30% - Token performance after entry',
+        consistency: '20% - Number of tokens',
+        recency: '10% - Recent activity',
+        profitFilter: 'Min 0.1 SOL profit OR 20% margin'
       },
       appliedFilters: {
         tokenLimit,
         topCount,
         minScore,
         blacklistedWallets: BLACKLISTED_WALLETS.size,
-        botDetection: 'Enabled',
-        minTokens: 'Minimum 2 different tokens required'
+        profitThreshold: '0.1 SOL or 20% margin',
+        minTokens: 2
       },
       timestamp: new Date()
     });
@@ -554,17 +635,17 @@ app.get('/api/dexscreener/:address', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'LOW CAP HUNTER API - Bot Filtered',
-    version: '2.2',
+    status: 'LOW CAP HUNTER API - Profit Filtered',
+    version: '2.3',
     endpoints: {
       wallet: '/api/wallet/:address',
-      discover: '/api/discover?limit=20&top=20',
+      discover: '/api/discover?limit=15&top=20',
       dexscreener: '/api/dexscreener/:address'
     },
     features: {
+      profitFiltering: 'Min 0.1 SOL profit OR 20% margin',
       blacklist: `${BLACKLISTED_WALLETS.size} institutional wallets blocked`,
-      botDetection: 'High-frequency traders filtered',
-      qualityFilters: 'Min 2 tokens, active in 90 days'
+      botDetection: 'High-frequency traders filtered'
     },
     timestamp: new Date() 
   });
@@ -573,5 +654,5 @@ app.get('/', (req, res) => {
 loadTokenRegistry();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('LOW CAP HUNTER API v2.2 - Bot Filtered running on port', PORT);
+  console.log('LOW CAP HUNTER API v2.3 - Profit Filtered running on port', PORT);
 });
