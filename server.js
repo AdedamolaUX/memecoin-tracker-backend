@@ -403,10 +403,34 @@ app.get('/api/discover', async (req, res) => {
                   if (transfer.mint === mintAddress && transfer.toUserAccount) {
                     const wallet = transfer.toUserAccount;
                     
-                    if (walletScores[wallet]) {
-                      walletScores[wallet].successScore += 5; // Bonus for being in multiple pumping tokens
-                      walletScores[wallet].totalTokens += 1;
+                    // CREATE wallet entry if doesn't exist
+                    if (!walletScores[wallet]) {
+                      walletScores[wallet] = {
+                        address: wallet,
+                        earlyEntryScore: 0,
+                        successScore: 0,
+                        consistencyScore: 0,
+                        recencyScore: 0,
+                        totalTokens: 0,
+                        earlyBuyCount: 0,
+                        lastActivity: tx.timestamp || 0,
+                        tokensFound: [],
+                        totalScore: 0
+                      };
                     }
+                    
+                    walletScores[wallet].successScore += 5; // Bonus for being in multiple pumping tokens
+                    walletScores[wallet].totalTokens += 1;
+                    walletScores[wallet].lastActivity = Math.max(walletScores[wallet].lastActivity, tx.timestamp || 0);
+                    
+                    // Track this token
+                    walletScores[wallet].tokensFound.push({
+                      symbol: tokenData[mintAddress].symbol,
+                      position: 0, // Unknown position for Birdeye tokens
+                      totalBuyers: 0,
+                      performance: tokenData[mintAddress].change24h,
+                      earlyEntry: false
+                    });
                   }
                 }
               }
@@ -455,22 +479,38 @@ app.get('/api/discover', async (req, res) => {
     });
     
     // QUALITY FILTERS
+    console.log('Before filtering:', Object.keys(walletScores).length, 'wallets');
+    
     let filteredWallets = Object.values(walletScores).filter(w => {
       // Remove likely bots (too many trades)
-      if (w.totalTokens > 100) return false;
+      if (w.totalTokens > 100) {
+        console.log('Removed bot:', w.address.slice(0, 8), 'tokens:', w.totalTokens);
+        return false;
+      }
       
-      // Require minimum diversity
-      if (w.totalTokens < 2) return false;
+      // Require minimum diversity (RELAXED: allow 1 token for now)
+      if (w.totalTokens < 1) {
+        console.log('Removed low activity:', w.address.slice(0, 8));
+        return false;
+      }
       
-      // Require recent activity (last 30 days)
+      // Require recent activity (RELAXED: last 90 days instead of 30)
       const daysSinceActive = (now - w.lastActivity) / 86400;
-      if (daysSinceActive > 30) return false;
+      if (daysSinceActive > 90) {
+        console.log('Removed inactive:', w.address.slice(0, 8), 'days:', daysSinceActive.toFixed(0));
+        return false;
+      }
       
       // Must meet minimum score
-      if (w.totalScore < minScore) return false;
+      if (w.totalScore < minScore) {
+        console.log('Removed low score:', w.address.slice(0, 8), 'score:', w.totalScore);
+        return false;
+      }
       
       return true;
     });
+    
+    console.log('After filtering:', filteredWallets.length, 'wallets');
     
     // Sort by total score
     filteredWallets.sort((a, b) => b.totalScore - a.totalScore);
@@ -549,8 +589,8 @@ app.get('/api/discover', async (req, res) => {
         topCount,
         minScore,
         removedBots: 'Wallets with >100 trades removed',
-        removedInactive: 'Wallets inactive >30 days removed',
-        minTokens: 'Minimum 2 different tokens required'
+        removedInactive: 'Wallets inactive >90 days removed',
+        minTokens: 'Minimum 1 token required'
       },
       
       timestamp: new Date()
