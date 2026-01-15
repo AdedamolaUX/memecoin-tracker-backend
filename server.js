@@ -10,631 +10,370 @@ app.use(express.json());
 
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
 let tokenCache = {};
+const trackedWallets = new Map();
+const walletClusters = new Map();
+const activeAlerts = new Map();
 
-const BLACKLISTED_WALLETS = new Set([
-  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
-  'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
-  'JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL2uJvfo',
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
-  '5Q544fKrFoe6tsEbD7S8EmEunGAV1gnGo',
-  'RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr',
-  'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
-  'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtL',
-  '5VCwKtCXgCJ6kit5FybXjvriW3xELsFDhYrPSqtJNmcD',
-  'GJRs4FRmzQ4G1hPqD1ZBNkq3FHhT4JNSB6pvPEKsxz',
-  '2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S',
-  'GUfCR9mK6azb9vcpsxgXyj7XRPAKJd4KMHTTVvtncGgp',
-  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-  'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM',
+const BLACKLISTED = new Set([
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
+  'JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL2uJvfo', '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  '5Q544fKrFoe6tsEbD7S8EmEunGAV1gnGo', 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+  'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtL', '5VCwKtCXgCJ6kit5FybXjvriW3xELsFDhYrPSqtJNmcD',
+  'GUfCR9mK6azb9vcpsxgXyj7XRPAKJd4KMHTTVvtncGgp', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
 ]);
 
-// RELAXED profit checking - more realistic thresholds
-async function analyzeWalletProfitability(walletData, walletAddress) {
+// TELEGRAM
+async function sendTelegram(msg) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
   try {
-    const txUrl = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=30`;
-    const txResponse = await fetch(txUrl);
-    const transactions = await txResponse.json();
-    
-    if (!Array.isArray(transactions) || transactions.length === 0) {
-      return { isProfitable: true, estimatedProfit: 0, reason: 'No data - assuming profitable' };
-    }
-    
-    let totalSOLIn = 0;
-    let totalSOLOut = 0;
-    let swapCount = 0;
-    
-    for (const tx of transactions) {
-      if (tx.type === 'SWAP' && tx.nativeTransfers) {
-        swapCount++;
-        
-        for (const transfer of tx.nativeTransfers) {
-          const amount = transfer.amount / 1e9;
-          
-          if (transfer.fromUserAccount === walletAddress) {
-            totalSOLIn += amount;
-          }
-          if (transfer.toUserAccount === walletAddress) {
-            totalSOLOut += amount;
-          }
-        }
-      }
-    }
-    
-    // RELAXED CRITERIA:
-    // 1. If we can't determine profit (totalSOLIn === 0), assume profitable
-    // 2. Lower threshold: 0.01 SOL profit OR 10% margin (instead of 0.1 SOL / 20%)
-    // 3. If few swaps (<3), be lenient
-    
-    if (totalSOLIn === 0 || swapCount < 3) {
-      return { 
-        isProfitable: true, 
-        estimatedProfit: 0,
-        profitMargin: 0,
-        reason: 'Insufficient data - assuming profitable'
-      };
-    }
-    
-    const netProfit = totalSOLOut - totalSOLIn;
-    const profitMargin = (netProfit / totalSOLIn) * 100;
-    
-    // RELAXED: 0.01 SOL or 10% margin (routers still have <1%)
-    if (netProfit < 0.01 && profitMargin < 10) {
-      return { 
-        isProfitable: false, 
-        estimatedProfit: netProfit,
-        profitMargin: profitMargin,
-        reason: `Low profit: ${netProfit.toFixed(3)} SOL (${profitMargin.toFixed(1)}%)`
-      };
-    }
-    
-    return { 
-      isProfitable: true, 
-      estimatedProfit: netProfit,
-      profitMargin: profitMargin,
-      tradeCount: swapCount
-    };
-    
-  } catch (err) {
-    console.error('Error analyzing profitability:', err.message);
-    // On error, assume profitable to avoid over-filtering
-    return { isProfitable: true, estimatedProfit: 0, reason: 'Error - assuming profitable' };
-  }
-}
-
-function isLikelyBot(walletData) {
-  if (walletData.totalTokens > 50) return true;
-  
-  const daysSinceActive = (Date.now() / 1000 - walletData.lastActivity) / 86400;
-  if (daysSinceActive < 1 && walletData.totalTokens > 10) return true;
-  
-  return false;
-}
-
-function isProgramAddress(address) {
-  const programPatterns = [
-    /pump$/i,
-    /111111/,
-    /AToken/,
-    /ZZZZ/i,
-  ];
-  
-  return programPatterns.some(pattern => pattern.test(address));
-}
-
-async function loadTokenRegistry() {
-  try {
-    const response = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
-    const data = await response.json();
-    data.tokens.forEach(token => {
-      tokenCache[token.address] = { symbol: token.symbol, name: token.name };
-    });
-    console.log('Loaded', Object.keys(tokenCache).length, 'tokens from registry');
-  } catch (err) {
-    console.error('Failed to load token registry:', err.message);
-  }
-}
-
-async function getTokenMetadata(address) {
-  if (tokenCache[address]) return tokenCache[address];
-  
-  try {
-    const url = `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`;
-    const response = await fetch(url, {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mintAccounts: [address] })
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: 'HTML', disable_web_page_preview: true })
     });
-    const data = await response.json();
-    if (data && data[0] && data[0].symbol && data[0].symbol !== 'UNKNOWN') {
-      const metadata = { symbol: data[0].symbol, name: data[0].name || data[0].symbol };
-      tokenCache[address] = metadata;
-      return metadata;
-    }
-  } catch (err) {}
-  
-  try {
-    const dexUrl = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
-    const dexResponse = await fetch(dexUrl);
-    const dexData = await dexResponse.json();
-    if (dexData && dexData.pairs && dexData.pairs[0]) {
-      const pair = dexData.pairs[0];
-      const metadata = { symbol: pair.baseToken.symbol, name: pair.baseToken.name };
-      tokenCache[address] = metadata;
-      return metadata;
-    }
-  } catch (err) {}
-  
-  return { symbol: address.slice(0, 4) + '...', name: 'Unknown' };
+    return (await res.json()).ok;
+  } catch { return false; }
 }
 
-async function getTokenMarketCap(address) {
-  try {
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-    const data = await response.json();
-    
-    if (data && data.pairs && data.pairs[0]) {
-      const pair = data.pairs[0];
-      return {
-        marketCap: pair.fdv || pair.marketCap || 0,
-        priceUsd: parseFloat(pair.priceUsd) || 0,
-        change24h: pair.priceChange?.h24 || 0,
-        volume24h: pair.volume?.h24 || 0,
-        liquidity: pair.liquidity?.usd || 0,
-        age: pair.pairCreatedAt ? Date.now() - pair.pairCreatedAt : null
-      };
-    }
-  } catch (err) {}
-  return { marketCap: 0, priceUsd: 0, change24h: 0, volume24h: 0, liquidity: 0, age: null };
+async function alertElite(w) {
+  const ws = w.address.slice(0, 6) + '...' + w.address.slice(-4);
+  let msg = `💎 <b>ELITE WALLET #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n💰 ${w.estimatedProfit} SOL\n📈 ${w.profitMargin}%\n🎯 ${w.earlyBuys} early buys\n\n🔗 <a href="https://solscan.io/account/${w.address}">Solscan</a>`;
+  await sendTelegram(msg);
 }
 
-function getTierInfo(percentile) {
-  if (percentile >= 95) return { tier: 'LEGENDARY', emoji: '👑', color: '#FFD700' };
-  if (percentile >= 90) return { tier: 'ELITE', emoji: '💎', color: '#B9F2FF' };
-  if (percentile >= 80) return { tier: 'EXPERT', emoji: '⚡', color: '#9D4EDD' };
-  if (percentile >= 70) return { tier: 'ADVANCED', emoji: '🔥', color: '#FF6B35' };
-  if (percentile >= 60) return { tier: 'SKILLED', emoji: '⭐', color: '#F72585' };
-  if (percentile >= 50) return { tier: 'PROFICIENT', emoji: '📈', color: '#4361EE' };
-  if (percentile >= 40) return { tier: 'COMPETENT', emoji: '✓', color: '#06D6A0' };
-  if (percentile >= 30) return { tier: 'INTERMEDIATE', emoji: '↗', color: '#26C485' };
-  if (percentile >= 20) return { tier: 'DEVELOPING', emoji: '📊', color: '#90E0EF' };
-  return { tier: 'NOVICE', emoji: '🌱', color: '#ADB5BD' };
+async function alertTrade(a) {
+  const ws = a.walletAddress.slice(0, 6) + '...' + a.walletAddress.slice(-4);
+  let msg = `🚨 <b>NEW TRADE</b>\n\n👤 <code>${ws}</code>\n⏰ ${new Date(a.timestamp * 1000).toLocaleString()}\n\n🪙 <b>Bought:</b>\n`;
+  (a.tokensBought || []).forEach(t => msg += `  • ${t.mint.slice(0, 6)}...${t.mint.slice(-4)}\n`);
+  msg += `\n🔗 <a href="https://solscan.io/account/${a.walletAddress}">View</a>`;
+  await sendTelegram(msg);
 }
 
-app.get('/api/wallet/:address', async (req, res) => {
+// WALLET CLUSTER
+async function findFunding(addr) {
   try {
-    const { address } = req.params;
+    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
+    const txs = await res.json();
+    if (!Array.isArray(txs)) return null;
     
-    const maxMarketCap = parseInt(req.query.maxMC) || 1000000;
-    const minSuccessRate = parseInt(req.query.minRate) || 40;
-    const minLowCapTrades = parseInt(req.query.minTrades) || 3;
-    
-    console.log('Analyzing wallet:', address);
-    
-    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
-    const response = await fetch(url);
-    const transactions = await response.json();
-    
-    if (!Array.isArray(transactions)) {
-      return res.json({
-        address,
-        error: 'Failed to fetch transactions: ' + (transactions.error || 'Unknown error')
-      });
-    }
-    
-    if (transactions.length === 0) {
-      return res.json({
-        address,
-        isEarlyEntrySpecialist: false,
-        error: 'No transactions found'
-      });
-    }
-    
-    const swaps = transactions.filter(tx => 
-      tx.type === 'SWAP' || (tx.tokenTransfers && tx.tokenTransfers.length > 0)
-    );
-    
-    const tokenSet = new Set();
-    const tokenEntries = {};
-    
-    for (const tx of swaps) {
-      if (tx.tokenTransfers) {
-        for (const transfer of tx.tokenTransfers) {
-          if (transfer.mint && transfer.mint !== 'So11111111111111111111111111111111111111112') {
-            tokenSet.add(transfer.mint);
-            if (!tokenEntries[transfer.mint]) {
-              tokenEntries[transfer.mint] = { firstSeen: tx.timestamp, address: transfer.mint };
-            }
-          }
+    const deps = {};
+    txs.forEach(tx => {
+      if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
+        if (t.toUserAccount === addr && t.fromUserAccount !== addr) {
+          if (!deps[t.from]) deps[t.from] = 0;
+          deps[t.from] += t.amount / 1e9;
         }
-      }
-    }
-    
-    let lowCapEntries = 0;
-    let successfulLowCapTrades = 0;
-    const analyzedTokens = [];
-    
-    const recentTokens = Array.from(tokenSet).slice(0, 5);
-    
-    for (const tokenAddr of recentTokens) {
-      const metadata = await getTokenMetadata(tokenAddr);
-      const mcData = await getTokenMarketCap(tokenAddr);
-      
-      const meetsLowCapCriteria = mcData.marketCap < maxMarketCap && mcData.marketCap > 0;
-      const isVeryNew = mcData.age && mcData.age < 7 * 24 * 60 * 60 * 1000;
-      
-      if (meetsLowCapCriteria || isVeryNew) {
-        lowCapEntries++;
-        if (mcData.marketCap > maxMarketCap * 10) {
-          successfulLowCapTrades++;
-        }
-      }
-      
-      analyzedTokens.push({
-        address: tokenAddr,
-        symbol: metadata.symbol,
-        name: metadata.name,
-        currentMC: mcData.marketCap,
-        meetsFilter: meetsLowCapCriteria,
-        isNew: isVeryNew,
-        firstTradedBy: new Date(tokenEntries[tokenAddr].firstSeen * 1000).toISOString()
       });
-      
-      await new Promise(r => setTimeout(r, 300));
-    }
-    
-    const earlyEntryRate = swaps.length > 0 ? Math.floor((lowCapEntries / Math.min(swaps.length, 20)) * 100) : 0;
-    const isSpecialist = lowCapEntries >= minLowCapTrades && earlyEntryRate >= minSuccessRate;
-    
-    res.json({
-      address,
-      isEarlyEntrySpecialist: isSpecialist,
-      lowCapEntries,
-      totalTrades: swaps.length,
-      earlyEntryRate,
-      successfulLowCapExits: successfulLowCapTrades,
-      score: Math.min(100, lowCapEntries * 20 + earlyEntryRate),
-      analyzedTokens,
-      lastActive: transactions[0]?.timestamp || Math.floor(Date.now() / 1000),
-      specialistBadge: isSpecialist ? 'EARLY ENTRY SPECIALIST' : null,
-      filters: { maxMarketCap, minSuccessRate, minLowCapTrades }
     });
     
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: error.message });
+    const sorted = Object.entries(deps).sort((a, b) => b[1] - a[1]);
+    if (sorted.length === 0 || BLACKLISTED.has(sorted[0][0])) return null;
+    return { fundingWallet: sorted[0][0], totalFunded: sorted[0][1] };
+  } catch { return null; }
+}
+
+async function findCluster(funding) {
+  try {
+    const res = await fetch(`https://api.helius.xyz/v0/addresses/${funding}/transactions?api-key=${HELIUS_API_KEY}&limit=200`);
+    const txs = await res.json();
+    if (!Array.isArray(txs)) return [];
+    
+    const wallets = new Set();
+    txs.forEach(tx => {
+      if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
+        if (t.fromUserAccount === funding && t.toUserAccount !== funding) wallets.add(t.toUserAccount);
+      });
+    });
+    return Array.from(wallets);
+  } catch { return []; }
+}
+
+// PROFIT ANALYSIS
+async function analyzeProfit(addr) {
+  try {
+    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=50`);
+    const txs = await res.json();
+    if (!Array.isArray(txs)) return { isProfitable: false, estimatedProfit: 0 };
+    
+    let solIn = 0, solOut = 0;
+    txs.forEach(tx => {
+      if (tx.type === 'SWAP' && tx.nativeTransfers) {
+        tx.nativeTransfers.forEach(t => {
+          const amt = t.amount / 1e9;
+          if (t.fromUserAccount === addr) solIn += amt;
+          if (t.toUserAccount === addr) solOut += amt;
+        });
+      }
+    });
+    
+    const profit = solOut - solIn;
+    return { 
+      isProfitable: profit >= 0.1, 
+      estimatedProfit: profit, 
+      profitMargin: solIn > 0 ? (profit / solIn) * 100 : 0 
+    };
+  } catch { return { isProfitable: false, estimatedProfit: 0 }; }
+}
+
+// MONITORING
+async function monitorWallet(addr) {
+  try {
+    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=5`);
+    const txs = await res.json();
+    if (!Array.isArray(txs) || txs.length === 0) return null;
+    
+    const tx = txs[0];
+    const lastSeen = activeAlerts.get(addr)?.timestamp || 0;
+    if (tx.timestamp <= lastSeen) return null;
+    
+    if (tx.type === 'SWAP' && tx.tokenTransfers) {
+      const bought = tx.tokenTransfers.filter(t => t.toUserAccount === addr).map(t => ({ mint: t.mint, amount: t.tokenAmount }));
+      if (bought.length > 0) {
+        const alert = { walletAddress: addr, timestamp: tx.timestamp, tokensBought: bought };
+        activeAlerts.set(addr, alert);
+        return alert;
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
+setInterval(async () => {
+  if (trackedWallets.size === 0) return;
+  console.log(`🔍 Monitoring ${trackedWallets.size} wallets...`);
+  for (const [addr, data] of trackedWallets) {
+    const alert = await monitorWallet(addr);
+    if (alert) {
+      console.log('🚨 Trade detected:', addr.slice(0, 8));
+      await alertTrade(alert);
+      if (!data.alerts) data.alerts = [];
+      data.alerts.unshift(alert);
+      data.alerts = data.alerts.slice(0, 20);
+    }
+    await new Promise(r => setTimeout(r, 500));
   }
-});
+}, 30000);
 
+// HELPERS
+async function loadTokens() {
+  try {
+    const res = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
+    const data = await res.json();
+    data.tokens.forEach(t => tokenCache[t.address] = { symbol: t.symbol, name: t.name });
+    console.log('✅ Loaded', Object.keys(tokenCache).length, 'tokens');
+  } catch (e) { console.error('Token registry error:', e.message); }
+}
+
+function isBot(w) {
+  return w.totalTokens > 50 || ((Date.now() / 1000 - w.lastActivity) / 86400 < 1 && w.totalTokens > 10);
+}
+
+function isProgram(addr) {
+  return /pump$/i.test(addr) || /111111/.test(addr) || /AToken/.test(addr) || /ZZZZ/i.test(addr);
+}
+
+function getTier(p) {
+  if (p >= 95) return { tier: 'LEGENDARY', emoji: '👑', color: '#FFD700' };
+  if (p >= 90) return { tier: 'ELITE', emoji: '💎', color: '#B9F2FF' };
+  if (p >= 80) return { tier: 'EXPERT', emoji: '⚡', color: '#9D4EDD' };
+  if (p >= 70) return { tier: 'ADVANCED', emoji: '🔥', color: '#FF6B35' };
+  return { tier: 'SKILLED', emoji: '⭐', color: '#F72585' };
+}
+
+// API ENDPOINTS
 app.get('/api/discover', async (req, res) => {
   try {
-    // INCREASED LIMITS for better results
-    const tokenLimit = Math.min(parseInt(req.query.limit) || 30, 50); // Increased from 15 to 30
-    const topCount = Math.min(parseInt(req.query.top) || 20, 50);
-    const minScore = parseInt(req.query.minScore) || 0;
-    const maxWalletsToCheck = 100; // Increased from 50 to 100
+    const limit = Math.min(parseInt(req.query.limit) || 40, 50);
+    const top = Math.min(parseInt(req.query.top) || 10, 20);
+    const minProfit = parseFloat(req.query.minProfit) || 0.1;
+    const alert = req.query.alert === 'true';
 
-    console.log('=== DISCOVERY START (RELAXED PROFIT FILTER) ===');
+    console.log('=== DISCOVERY START ===');
 
-    const walletScores = {};
+    const scores = {};
     const tokenData = {};
-    let tokensAnalyzed = 0;
-    let heliusErrors = 0;
-    let filteredOutBots = 0;
-    let filteredOutInstitutional = 0;
-    let filteredOutLowProfit = 0;
+    let analyzed = 0;
+
+    // Fetch new tokens
+    const dexRes = await fetch('https://api.dexscreener.com/latest/dex/search?q=new&chain=solana');
+    const dexData = await dexRes.json();
+    const tokens = (dexData.pairs || []).filter(p => p.chainId === 'solana').slice(0, limit);
     
-    console.log('Fetching DexScreener tokens...');
-    try {
-      const newPairsUrl = 'https://api.dexscreener.com/latest/dex/search?q=new&chain=solana';
-      const newResponse = await fetch(newPairsUrl);
-      const newData = await newResponse.json();
+    console.log(`Analyzing ${tokens.length} tokens...`);
+
+    // Analyze each token
+    for (const token of tokens) {
+      const mint = token.baseToken.address;
+      tokenData[mint] = { symbol: token.baseToken.symbol, change24h: token.priceChange?.h24 || 0 };
       
-      const newTokens = (newData.pairs || [])
-        .filter(p => p.chainId === 'solana')
-        .slice(0, tokenLimit);
-      
-      console.log(`Found ${newTokens.length} DexScreener tokens`);
-      
-      for (const token of newTokens) {
-        const mintAddress = token.baseToken.address;
+      try {
+        const txRes = await fetch(`https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
+        const txs = await txRes.json();
+        if (!Array.isArray(txs) || txs.length === 0) continue;
         
-        tokenData[mintAddress] = {
-          symbol: token.baseToken.symbol,
-          initialMC: token.fdv || token.marketCap || 0,
-          currentMC: token.fdv || token.marketCap || 0,
-          change24h: token.priceChange?.h24 || 0,
-          volume24h: token.volume?.h24 || 0,
-          createdAt: token.pairCreatedAt || Date.now()
-        };
+        analyzed++;
+        const buyers = new Map();
         
-        try {
-          const txUrl = `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=100`;
-          const txResponse = await fetch(txUrl);
-          const transactions = await txResponse.json();
-          
-          if (!Array.isArray(transactions)) {
-            heliusErrors++;
-            continue;
-          }
-          
-          if (transactions.length === 0) continue;
-          
-          tokensAnalyzed++;
-          
-          const buyerTimestamps = new Map();
-          const totalBuyers = new Set();
-          
-          for (const tx of transactions) {
-            if (tx.tokenTransfers) {
-              for (const transfer of tx.tokenTransfers) {
-                if (transfer.mint === mintAddress && transfer.toUserAccount) {
-                  const wallet = transfer.toUserAccount;
-                  
-                  if (BLACKLISTED_WALLETS.has(wallet)) {
-                    filteredOutInstitutional++;
-                    continue;
-                  }
-                  
-                  if (isProgramAddress(wallet)) {
-                    filteredOutInstitutional++;
-                    continue;
-                  }
-                  
-                  totalBuyers.add(wallet);
-                  
-                  if (!buyerTimestamps.has(wallet)) {
-                    buyerTimestamps.set(wallet, tx.timestamp);
-                  }
-                }
-              }
+        txs.forEach(tx => {
+          if (tx.tokenTransfers) tx.tokenTransfers.forEach(t => {
+            if (t.mint === mint && t.toUserAccount && !BLACKLISTED.has(t.toUserAccount) && !isProgram(t.toUserAccount)) {
+              if (!buyers.has(t.toUserAccount)) buyers.set(t.toUserAccount, tx.timestamp);
             }
-          }
-          
-          const sortedBuyers = Array.from(buyerTimestamps.entries()).sort((a, b) => a[1] - b[1]);
-          const totalBuyerCount = sortedBuyers.length;
-          
-          sortedBuyers.forEach(([wallet, timestamp], index) => {
-            if (!walletScores[wallet]) {
-              walletScores[wallet] = {
-                address: wallet,
-                earlyEntryScore: 0,
-                successScore: 0,
-                consistencyScore: 0,
-                recencyScore: 0,
-                totalTokens: 0,
-                earlyBuyCount: 0,
-                lastActivity: 0,
-                tokensFound: [],
-                totalScore: 0
-              };
-            }
-            
-            const w = walletScores[wallet];
-            w.totalTokens += 1;
-            w.lastActivity = Math.max(w.lastActivity, timestamp);
-            
-            const position = index + 1;
-            const positionPercentile = (position / totalBuyerCount) * 100;
-            
-            let earlyPoints = 0;
-            if (positionPercentile <= 5) {
-              earlyPoints = 10;
-              w.earlyBuyCount += 1;
-            } else if (positionPercentile <= 10) {
-              earlyPoints = 7;
-              w.earlyBuyCount += 1;
-            } else if (positionPercentile <= 20) {
-              earlyPoints = 4;
-            } else if (positionPercentile <= 50) {
-              earlyPoints = 1;
-            }
-            
-            w.earlyEntryScore += earlyPoints;
-            
-            const tokenPerformance = tokenData[mintAddress].change24h;
-            if (tokenPerformance > 100) w.successScore += 15;
-            else if (tokenPerformance > 50) w.successScore += 10;
-            else if (tokenPerformance > 20) w.successScore += 5;
-            else if (tokenPerformance > 0) w.successScore += 2;
-            
-            w.tokensFound.push({
-              symbol: tokenData[mintAddress].symbol,
-              position,
-              totalBuyers: totalBuyerCount,
-              performance: tokenPerformance,
-              earlyEntry: earlyPoints > 0
-            });
           });
-          
-          await new Promise(r => setTimeout(r, 800));
-        } catch (err) {
-          console.error(`Error processing ${token.baseToken.symbol}:`, err.message);
-          heliusErrors++;
-        }
-      }
-    } catch (err) {
-      console.error('DexScreener error:', err.message);
-    }
-    
-    console.log(`Total wallets before filtering: ${Object.keys(walletScores).length}`);
-    
-    const now = Date.now() / 1000;
-    Object.values(walletScores).forEach(w => {
-      if (w.totalTokens >= 5) w.consistencyScore = 20;
-      else if (w.totalTokens >= 3) w.consistencyScore = 15;
-      else if (w.totalTokens >= 2) w.consistencyScore = 10;
-      else w.consistencyScore = 5;
-      
-      if (w.earlyBuyCount >= 3) w.consistencyScore += 10;
-      
-      const daysSinceLastActivity = (now - w.lastActivity) / 86400;
-      if (daysSinceLastActivity <= 1) w.recencyScore = 10;
-      else if (daysSinceLastActivity <= 7) w.recencyScore = 7;
-      else if (daysSinceLastActivity <= 30) w.recencyScore = 4;
-      else w.recencyScore = 1;
-      
-      w.totalScore = 
-        (w.earlyEntryScore * 0.4) + 
-        (w.successScore * 0.3) + 
-        (w.consistencyScore * 0.2) + 
-        (w.recencyScore * 0.1);
-    });
-    
-    console.log(`Analyzing wallet profitability (checking top ${maxWalletsToCheck})...`);
-    const walletsToCheck = Object.values(walletScores)
-      .sort((a, b) => b.totalScore - a.totalScore)
-      .slice(0, maxWalletsToCheck);
-    
-    const profitableWallets = [];
-    
-    for (const wallet of walletsToCheck) {
-      if (isLikelyBot(wallet)) {
-        filteredOutBots++;
-        continue;
-      }
-      
-      if (wallet.totalTokens < 2) continue;
-      
-      const daysSinceActive = (now - wallet.lastActivity) / 86400;
-      if (daysSinceActive > 90) continue;
-      
-      const profitAnalysis = await analyzeWalletProfitability(wallet, wallet.address);
-      
-      if (!profitAnalysis.isProfitable) {
-        filteredOutLowProfit++;
-        console.log(`Filtered ${wallet.address.slice(0, 8)}: ${profitAnalysis.reason}`);
-        continue;
-      }
-      
-      wallet.estimatedProfit = profitAnalysis.estimatedProfit;
-      wallet.profitMargin = profitAnalysis.profitMargin;
-      
-      profitableWallets.push(wallet);
-      
-      await new Promise(r => setTimeout(r, 600));
-      
-      if (profitableWallets.length >= topCount) break;
-    }
-    
-    console.log(`Found ${profitableWallets.length} profitable wallets`);
-    console.log(`Filtered: ${filteredOutLowProfit} low-profit, ${filteredOutBots} bots, ${filteredOutInstitutional} institutional`);
-    
-    profitableWallets.sort((a, b) => b.totalScore - a.totalScore);
-    
-    const maxScore = profitableWallets[0]?.totalScore || 1;
-    const minScoreVal = profitableWallets[profitableWallets.length - 1]?.totalScore || 0;
-    const scoreRange = maxScore - minScoreVal || 1;
-    
-    const discoveredWallets = profitableWallets
-      .slice(0, topCount)
-      .map((w, i) => {
-        const percentile = Math.round(((w.totalScore - minScoreVal) / scoreRange) * 100);
-        const tierInfo = getTierInfo(percentile);
+        });
         
-        return {
-          rank: i + 1,
-          address: w.address,
-          successScore: percentile,
-          totalScore: Math.round(w.totalScore),
-          tier: tierInfo.tier,
-          badge: tierInfo.emoji,
-          tierColor: tierInfo.color,
-          estimatedProfit: w.estimatedProfit?.toFixed(3) || '0',
-          profitMargin: w.profitMargin?.toFixed(1) || '0',
-          earlyEntryScore: Math.round(w.earlyEntryScore),
-          successRateScore: Math.round(w.successScore),
-          consistencyScore: Math.round(w.consistencyScore),
-          recencyScore: Math.round(w.recencyScore),
-          earlyBuys: w.earlyBuyCount,
-          totalTokensTraded: w.totalTokens,
-          daysSinceActive: Math.round((now - w.lastActivity) / 86400),
-          tokensFound: w.tokensFound.slice(0, 5)
-        };
-      });
+        const sorted = Array.from(buyers.entries()).sort((a, b) => a[1] - b[1]);
+        sorted.forEach(([wallet, ts], i) => {
+          if (!scores[wallet]) scores[wallet] = { address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, earlyBuyCount: 0, lastActivity: 0, tokensFound: [] };
+          
+          const w = scores[wallet];
+          w.totalTokens++;
+          w.lastActivity = Math.max(w.lastActivity, ts);
+          
+          const percentile = ((i + 1) / sorted.length) * 100;
+          if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
+          else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
+          
+          const perf = tokenData[mint].change24h;
+          if (perf > 100) w.successScore += 15;
+          else if (perf > 50) w.successScore += 10;
+          else if (perf > 20) w.successScore += 5;
+          
+          w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf });
+        });
+        
+        await new Promise(r => setTimeout(r, 800));
+      } catch {}
+    }
+
+    // Filter and analyze profitability
+    const candidates = Object.values(scores)
+      .filter(w => !isBot(w) && w.totalTokens >= 2)
+      .sort((a, b) => (b.earlyEntryScore + b.successScore) - (a.earlyEntryScore + a.successScore))
+      .slice(0, top * 2);
     
-    console.log('=== DISCOVERY COMPLETE ===');
-    
+    const elite = [];
+    for (const w of candidates) {
+      const profit = await analyzeProfit(w.address);
+      if (!profit.isProfitable || profit.estimatedProfit < minProfit) continue;
+      
+      const funding = await findFunding(w.address);
+      let cluster = [];
+      if (funding) {
+        cluster = await findCluster(funding.fundingWallet);
+        walletClusters.set(funding.fundingWallet, cluster);
+      }
+      
+      w.estimatedProfit = profit.estimatedProfit;
+      w.profitMargin = profit.profitMargin;
+      w.fundingWallet = funding?.fundingWallet || null;
+      w.clusterSize = cluster.length;
+      
+      elite.push(w);
+      await new Promise(r => setTimeout(r, 1000));
+      if (elite.length >= top) break;
+    }
+
+    const discovered = elite.map((w, i) => {
+      const tier = getTier(95);
+      return {
+        rank: i + 1,
+        address: w.address,
+        tier: tier.tier,
+        badge: tier.emoji,
+        tierColor: tier.color,
+        estimatedProfit: w.estimatedProfit.toFixed(2),
+        profitMargin: w.profitMargin.toFixed(1),
+        earlyBuys: w.earlyBuyCount,
+        totalTokensTraded: w.totalTokens,
+        fundingWallet: w.fundingWallet,
+        clusterSize: w.clusterSize,
+        tokensFound: w.tokensFound.slice(0, 3)
+      };
+    });
+
+    if (alert && discovered.length > 0) {
+      for (const w of discovered.slice(0, 3)) {
+        await alertElite(w);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
     res.json({
       success: true,
-      discoveredWallets,
-      stats: {
-        totalWalletsScanned: Object.keys(walletScores).length,
-        walletsCheckedForProfit: walletsToCheck.length,
-        profitableWallets: profitableWallets.length,
-        tokensAnalyzed,
-        heliusErrors,
-        filteredInstitutional: filteredOutInstitutional,
-        filteredBots: filteredOutBots,
-        filteredLowProfit: filteredOutLowProfit,
-        averageScore: discoveredWallets.length > 0 ? Math.round(discoveredWallets.reduce((sum, w) => sum + w.totalScore, 0) / discoveredWallets.length) : 0
-      },
-      tierDistribution: {
-        legendary: discoveredWallets.filter(w => w.tier === 'LEGENDARY').length,
-        elite: discoveredWallets.filter(w => w.tier === 'ELITE').length,
-        expert: discoveredWallets.filter(w => w.tier === 'EXPERT').length,
-        advanced: discoveredWallets.filter(w => w.tier === 'ADVANCED').length,
-        skilled: discoveredWallets.filter(w => w.tier === 'SKILLED').length,
-        other: discoveredWallets.filter(w => !['LEGENDARY', 'ELITE', 'EXPERT', 'ADVANCED', 'SKILLED'].includes(w.tier)).length
-      },
-      scoringBreakdown: {
-        earlyEntry: '40% - Position in buy order',
-        successRate: '30% - Token performance',
-        consistency: '20% - Number of tokens',
-        recency: '10% - Recent activity',
-        profitFilter: 'RELAXED: 0.01 SOL or 10% margin (was 0.1 SOL / 20%)'
-      },
-      appliedFilters: {
-        tokenLimit,
-        topCount,
-        minScore,
-        maxWalletsChecked: maxWalletsToCheck,
-        blacklistedWallets: BLACKLISTED_WALLETS.size,
-        profitThreshold: '0.01 SOL or 10% margin',
-        minTokens: 2
-      },
+      discoveredWallets: discovered,
+      stats: { tokensAnalyzed: analyzed, walletsScanned: Object.keys(scores).length, eliteWalletsFound: elite.length },
+      telegramEnabled: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
       timestamp: new Date()
     });
-    
   } catch (error) {
-    console.error('Discovery error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get('/api/dexscreener/:address', async (req, res) => {
-  try {
-    const { address } = req.params;
-    const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+app.post('/api/track/:address', async (req, res) => {
+  const { address } = req.params;
+  if (trackedWallets.has(address)) return res.json({ success: false, message: 'Already tracked' });
+  
+  trackedWallets.set(address, { address, addedAt: Date.now(), alerts: [] });
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+    await sendTelegram(`✅ <b>Tracking Started</b>\n\n<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\nTotal: ${trackedWallets.size}`);
   }
+  res.json({ success: true, trackedCount: trackedWallets.size });
+});
+
+app.delete('/api/track/:address', (req, res) => {
+  const { address } = req.params;
+  if (!trackedWallets.has(address)) return res.json({ success: false });
+  trackedWallets.delete(address);
+  activeAlerts.delete(address);
+  res.json({ success: true, trackedCount: trackedWallets.size });
+});
+
+app.get('/api/tracked', (req, res) => {
+  res.json({ success: true, trackedWallets: Array.from(trackedWallets.values()), count: trackedWallets.size });
+});
+
+app.get('/api/alerts', (req, res) => {
+  res.json({ success: true, alerts: Array.from(activeAlerts.values()).sort((a, b) => b.timestamp - a.timestamp).slice(0, 50) });
+});
+
+app.get('/api/clusters', (req, res) => {
+  res.json({ success: true, clusters: Array.from(walletClusters.entries()).map(([f, w]) => ({ fundingWallet: f, walletCount: w.length, wallets: w.slice(0, 10) })) });
+});
+
+app.get('/api/telegram/test', async (req, res) => {
+  const sent = await sendTelegram('🧪 <b>Test Alert</b>\n\nBot is working! ✅');
+  res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
+});
+
+app.post('/api/telegram/test', async (req, res) => {
+  const sent = await sendTelegram('🧪 <b>Test Alert</b>\n\nBot is working! ✅');
+  res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
 });
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'LOW CAP HUNTER API - Balanced Filters',
-    version: '2.4',
+    status: 'Elite Tracker v3.0',
+    telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
-      wallet: '/api/wallet/:address',
-      discover: '/api/discover?limit=30&top=20',
-      dexscreener: '/api/dexscreener/:address'
+      discover: '/api/discover?limit=40&top=10&alert=true',
+      track: 'POST /api/track/:address',
+      tracked: '/api/tracked',
+      alerts: '/api/alerts',
+      clusters: '/api/clusters',
+      test: '/api/telegram/test'
     },
-    features: {
-      profitFiltering: 'RELAXED: 0.01 SOL or 10% margin',
-      tokenLimit: 'Default 30 (increased from 15)',
-      walletsChecked: 'Top 100 (increased from 50)',
-      blacklist: `${BLACKLISTED_WALLETS.size} institutional wallets`
-    },
-    timestamp: new Date() 
+    stats: { tracked: trackedWallets.size, clusters: walletClusters.size, alerts: activeAlerts.size }
   });
 });
 
-loadTokenRegistry();
-
+loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('LOW CAP HUNTER API v2.4 - Balanced Filters running on port', PORT);
+  console.log('🚀 Elite Tracker v3.0 on port', PORT);
+  console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
 });
