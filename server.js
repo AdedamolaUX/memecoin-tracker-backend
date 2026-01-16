@@ -10,8 +10,8 @@ app.use(express.json());
 
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
 const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8206928980:AAGi-70Y49FU0sBUCzpmHLceqI-HUyepWV0';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '2016411718';
 
 let tokenCache = {};
 const trackedWallets = new Map();
