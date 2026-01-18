@@ -27,7 +27,6 @@ const BLACKLISTED = new Set([
   'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM',
 ]);
 
-// TELEGRAM
 async function sendTelegram(msg) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
   try {
@@ -49,19 +48,19 @@ async function alertElite(w) {
   msg += `💼 Unrealized: ${w.unrealizedPNL} SOL\n`;
   msg += `📈 Margin: ${w.profitMargin}%\n`;
   msg += `🎯 ${w.earlyBuys} early buys\n`;
-  msg += `📊 ${w.totalTokensTraded} tokens traded\n`;
+  msg += `📊 ${w.totalTokensTraded} tokens\n`;
   if (w.fundingWallet) {
     const fs = w.fundingWallet.slice(0, 6) + '...' + w.fundingWallet.slice(-4);
-    msg += `\n👥 <b>Cluster:</b>\nFunding: <code>${fs}</code>\nSize: ${w.clusterSize} wallets\n`;
+    msg += `\n👥 Cluster: <code>${fs}</code> (${w.clusterSize} wallets)\n`;
   }
-  msg += `\n🔗 <a href="https://solscan.io/account/${w.address}">View on Solscan</a>`;
+  msg += `\n🔗 <a href="https://solscan.io/account/${w.address}">Solscan</a>`;
   await sendTelegram(msg);
 }
 
 async function alertTrade(a) {
   const ws = a.walletAddress.slice(0, 6) + '...' + a.walletAddress.slice(-4);
-  let msg = `🚨 <b>NEW TRADE ALERT</b>\n\n👤 <code>${ws}</code>\n⏰ ${new Date(a.timestamp * 1000).toLocaleString()}\n\n🪙 <b>Bought:</b>\n`;
-  (a.tokensBought || []).forEach(t => msg += `  • ${t.mint.slice(0, 6)}...${t.mint.slice(-4)}\n    Amount: ${t.amount || 'Unknown'}\n`);
+  let msg = `🚨 <b>NEW TRADE</b>\n\n👤 <code>${ws}</code>\n⏰ ${new Date(a.timestamp * 1000).toLocaleString()}\n\n🪙 Bought:\n`;
+  (a.tokensBought || []).forEach(t => msg += `  • ${t.mint.slice(0, 6)}...${t.mint.slice(-4)}\n`);
   msg += `\n🔗 <a href="https://solscan.io/account/${a.walletAddress}">Solscan</a>`;
   if (a.tokensBought && a.tokensBought[0]) {
     msg += `\n📊 <a href="https://dexscreener.com/solana/${a.tokensBought[0].mint}">DexScreener</a>`;
@@ -69,30 +68,26 @@ async function alertTrade(a) {
   await sendTelegram(msg);
 }
 
-// GET TOKEN PRICE IN SOL
 async function getTokenPriceInSOL(tokenMint) {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`);
     const data = await res.json();
     if (data && data.pairs && data.pairs[0]) {
       const priceUSD = parseFloat(data.pairs[0].priceUsd) || 0;
-      // Get SOL price in USD
       const solRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
       const solData = await solRes.json();
       const solPriceUSD = parseFloat(solData.pairs?.[0]?.priceUsd) || 100;
-      return priceUSD / solPriceUSD; // Token price in SOL
+      return priceUSD / solPriceUSD;
     }
     return 0;
   } catch { return 0; }
 }
 
-// GET WALLET TOKEN BALANCES
 async function getWalletBalances(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/balances?api-key=${HELIUS_API_KEY}`);
     const data = await res.json();
     if (!data || !data.tokens) return [];
-    
     return data.tokens.map(t => ({
       mint: t.mint,
       amount: t.amount / Math.pow(10, t.decimals || 9)
@@ -100,13 +95,11 @@ async function getWalletBalances(addr) {
   } catch { return []; }
 }
 
-// WALLET CLUSTER
 async function findFunding(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
     const txs = await res.json();
     if (!Array.isArray(txs)) return null;
-    
     const deps = {};
     txs.forEach(tx => {
       if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
@@ -116,7 +109,6 @@ async function findFunding(addr) {
         }
       });
     });
-    
     const sorted = Object.entries(deps).sort((a, b) => b[1] - a[1]);
     if (sorted.length === 0 || BLACKLISTED.has(sorted[0][0])) return null;
     return { fundingWallet: sorted[0][0], totalFunded: sorted[0][1] };
@@ -128,7 +120,6 @@ async function findCluster(funding) {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${funding}/transactions?api-key=${HELIUS_API_KEY}&limit=200`);
     const txs = await res.json();
     if (!Array.isArray(txs)) return [];
-    
     const wallets = new Set();
     txs.forEach(tx => {
       if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
@@ -139,36 +130,28 @@ async function findCluster(funding) {
   } catch { return []; }
 }
 
-// PROFIT ANALYSIS WITH UNREALIZED PNL
 async function analyzeProfit(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=50`);
     const txs = await res.json();
     if (!Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
     
-    // Calculate realized profit (SOL in/out from swaps)
     let solIn = 0, solOut = 0;
-    const tokensBought = {}; // Track tokens bought with their cost
+    const tokensBought = {};
     
     txs.forEach(tx => {
       if (tx.type === 'SWAP' && tx.nativeTransfers && tx.tokenTransfers) {
-        // Track SOL spent/received
         tx.nativeTransfers.forEach(t => {
           const amt = t.amount / 1e9;
           if (t.fromUserAccount === addr) solIn += amt;
           if (t.toUserAccount === addr) solOut += amt;
         });
-        
-        // Track tokens bought (for unrealized PNL calculation)
         tx.tokenTransfers.forEach(t => {
           if (t.toUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112') {
             if (!tokensBought[t.mint]) tokensBought[t.mint] = { amount: 0, costInSOL: 0 };
-            
-            // Find corresponding SOL spent in this transaction
             const solSpent = tx.nativeTransfers
               .filter(nt => nt.fromUserAccount === addr)
               .reduce((sum, nt) => sum + (nt.amount / 1e9), 0);
-            
             tokensBought[t.mint].costInSOL += solSpent;
           }
         });
@@ -176,30 +159,22 @@ async function analyzeProfit(addr) {
     });
     
     const realizedProfit = solOut - solIn;
-    
-    // Calculate unrealized PNL (current holdings)
     let unrealizedPNL = 0;
     const balances = await getWalletBalances(addr);
     
     for (const balance of balances) {
-      if (balance.mint === 'So11111111111111111111111111111111111111112') continue; // Skip SOL
-      
+      if (balance.mint === 'So11111111111111111111111111111111111111112') continue;
       const priceInSOL = await getTokenPriceInSOL(balance.mint);
       const currentValueInSOL = balance.amount * priceInSOL;
-      
-      // If we tracked the cost, calculate PNL; otherwise just count current value
       if (tokensBought[balance.mint]) {
         unrealizedPNL += (currentValueInSOL - tokensBought[balance.mint].costInSOL);
       } else {
-        // Conservative: assume they got it for free (airdrop, etc.)
         unrealizedPNL += currentValueInSOL;
       }
-      
-      await new Promise(r => setTimeout(r, 200)); // Rate limit
+      await new Promise(r => setTimeout(r, 200));
     }
     
     const totalProfit = realizedProfit + unrealizedPNL;
-    
     return { 
       isProfitable: totalProfit >= 0.1, 
       totalProfit,
@@ -213,17 +188,14 @@ async function analyzeProfit(addr) {
   }
 }
 
-// MONITORING
 async function monitorWallet(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=5`);
     const txs = await res.json();
     if (!Array.isArray(txs) || txs.length === 0) return null;
-    
     const tx = txs[0];
     const lastSeen = activeAlerts.get(addr)?.timestamp || 0;
     if (tx.timestamp <= lastSeen) return null;
-    
     if (tx.type === 'SWAP' && tx.tokenTransfers) {
       const bought = tx.tokenTransfers.filter(t => t.toUserAccount === addr).map(t => ({ mint: t.mint, amount: t.tokenAmount }));
       if (bought.length > 0) {
@@ -252,7 +224,6 @@ setInterval(async () => {
   }
 }, 30000);
 
-// HELPERS
 async function loadTokens() {
   try {
     const res = await fetch('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
@@ -279,7 +250,6 @@ function getTier(p) {
   return { tier: 'PROFICIENT', emoji: '📈', color: '#4361EE' };
 }
 
-// API ENDPOINTS
 app.get('/api/discover', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 40, 50);
@@ -294,14 +264,12 @@ app.get('/api/discover', async (req, res) => {
     const tokenData = {};
     let analyzed = 0, errors = 0, filtered = 0;
 
-    // Fetch new tokens
     const dexRes = await fetch('https://api.dexscreener.com/latest/dex/search?q=new&chain=solana');
     const dexData = await dexRes.json();
     const tokens = (dexData.pairs || []).filter(p => p.chainId === 'solana').slice(0, limit);
     
     console.log(`Analyzing ${tokens.length} tokens...`);
 
-    // Analyze each token
     for (const token of tokens) {
       const mint = token.baseToken.address;
       tokenData[mint] = { symbol: token.baseToken.symbol, change24h: token.priceChange?.h24 || 0 };
@@ -347,9 +315,8 @@ app.get('/api/discover', async (req, res) => {
     }
 
     console.log(`Found ${Object.keys(scores).length} wallets`);
-    console.log('Analyzing profitability (including unrealized PNL)...');
+    console.log('Analyzing profitability...');
 
-    // Filter and analyze profitability
     const candidates = Object.values(scores)
       .filter(w => !isBot(w) && w.totalTokens >= 2)
       .sort((a, b) => (b.earlyEntryScore + b.successScore) - (a.earlyEntryScore + a.successScore))
@@ -362,18 +329,18 @@ app.get('/api/discover', async (req, res) => {
       const profit = await analyzeProfit(w.address);
       if (!profit.isProfitable || profit.totalProfit < minProfit) {
         filtered++;
-        console.log(`  ❌ Total profit: ${profit.totalProfit.toFixed(3)} SOL (realized: ${profit.realizedProfit.toFixed(3)}, unrealized: ${profit.unrealizedPNL.toFixed(3)})`);
+        console.log(`  ❌ Total: ${profit.totalProfit.toFixed(3)} SOL`);
         continue;
       }
       
-      console.log(`  ✅ Total: ${profit.totalProfit.toFixed(2)} SOL (realized: ${profit.realizedProfit.toFixed(2)}, unrealized: ${profit.unrealizedPNL.toFixed(2)})`);
+      console.log(`  ✅ Total: ${profit.totalProfit.toFixed(2)} SOL (R: ${profit.realizedProfit.toFixed(2)}, U: ${profit.unrealizedPNL.toFixed(2)})`);
       
       const funding = await findFunding(w.address);
       let cluster = [];
       if (funding) {
         cluster = await findCluster(funding.fundingWallet);
         walletClusters.set(funding.fundingWallet, cluster);
-        console.log(`  👥 Cluster: ${cluster.length} wallets`);
+        console.log(`  👥 Cluster: ${cluster.length}`);
       }
       
       w.totalProfit = profit.totalProfit;
@@ -384,7 +351,7 @@ app.get('/api/discover', async (req, res) => {
       w.clusterSize = cluster.length;
       
       elite.push(w);
-      await new Promise(r => setTimeout(r, 1500)); // Slower for price lookups
+      await new Promise(r => setTimeout(r, 1500));
       if (elite.length >= top) break;
     }
 
@@ -410,9 +377,8 @@ app.get('/api/discover', async (req, res) => {
       };
     });
 
-    // Send Telegram alerts
     if (alert && discovered.length > 0) {
-      console.log(`📱 Sending alerts for ${Math.min(3, discovered.length)} wallets...`);
+      console.log(`📱 Sending alerts...`);
       for (const w of discovered.slice(0, 3)) {
         await alertElite(w);
         await new Promise(r => setTimeout(r, 1000));
@@ -442,12 +408,10 @@ app.get('/api/discover', async (req, res) => {
 app.post('/api/track/:address', async (req, res) => {
   const { address } = req.params;
   if (trackedWallets.has(address)) return res.json({ success: false, message: 'Already tracked' });
-  
   trackedWallets.set(address, { address, addedAt: Date.now(), alerts: [] });
   console.log(`✅ Tracking: ${address.slice(0, 8)}...`);
-  
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    await sendTelegram(`✅ <b>Tracking Started</b>\n\n<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\nTotal: ${trackedWallets.size}\nMonitoring: Every 30 seconds`);
+    await sendTelegram(`✅ <b>Tracking Started</b>\n\n<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\nTotal: ${trackedWallets.size}\nMonitoring: Every 30s`);
   }
   res.json({ success: true, trackedCount: trackedWallets.size });
 });
@@ -473,18 +437,18 @@ app.get('/api/clusters', (req, res) => {
 });
 
 app.get('/api/telegram/test', async (req, res) => {
-  const sent = await sendTelegram('🧪 <b>Test Alert</b>\n\nBot is working! ✅');
+  const sent = await sendTelegram('🧪 <b>Test Alert</b>\n\nBot working! ✅');
   res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
 });
 
 app.post('/api/telegram/test', async (req, res) => {
-  const sent = await sendTelegram('🧪 <b>Test Alert</b>\n\nBot is working! ✅');
+  const sent = await sendTelegram('🧪 <b>Test Alert</b>\n\nBot working! ✅');
   res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
 });
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v3.1 - LIVE (with Unrealized PNL)',
+    status: 'Elite Tracker v3.1 - Unrealized PNL',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
       discover: '/api/discover?limit=40&top=10&alert=true&minProfit=0.1',
@@ -496,14 +460,7 @@ app.get('/', (req, res) => {
       test: '/api/telegram/test'
     },
     stats: { tracked: trackedWallets.size, clusters: walletClusters.size, alerts: activeAlerts.size },
-    features: [
-      'Elite wallet discovery (>0.1 SOL total profit)',
-      'Realized + Unrealized PNL tracking',
-      'Wallet cluster detection',
-      'Real-time monitoring (30s intervals)',
-      'Telegram alerts',
-      'Bot & institutional filtering'
-    ]
+    features: ['Elite discovery (>0.1 SOL total)', 'Realized + Unrealized PNL', 'Wallet clusters', 'Real-time monitoring', 'Telegram alerts']
   });
 });
 
@@ -511,34 +468,5 @@ loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
   console.log('🚀 Elite Tracker v3.1 on port', PORT);
   console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
-  console.log('💼 Unrealized PNL tracking: ✅');
+  console.log('💼 Unrealized PNL: ✅');
 });
-```
-
----
-
-## **🆕 What Changed:**
-
-1. **Added `getTokenPriceInSOL()`** - Gets current token price
-2. **Added `getWalletBalances()`** - Gets current token holdings
-3. **Enhanced `analyzeProfit()`** - Now calculates:
-   - ✅ **Realized profit** (SOL in/out)
-   - ✅ **Unrealized PNL** (current value of holdings)
-   - ✅ **Total profit** (realized + unrealized)
-4. **Updated Telegram alerts** - Shows breakdown of both
-5. **Stricter filtering** - Total profit must be ≥0.1 SOL
-
----
-
-## **📊 Example Output:**
-```
-💎 ELITE WALLET #1
-
-👑 LEGENDARY
-7xKXtg...A83T
-
-💰 Total Profit: 3.45 SOL
-📊 Realized: 2.10 SOL
-💼 Unrealized: 1.35 SOL
-📈 Margin: 220.5%
-🎯 5 early buys
