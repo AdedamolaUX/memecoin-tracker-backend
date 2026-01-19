@@ -288,7 +288,6 @@ app.get('/api/discover', async (req, res) => {
     const scores = {};
     const tokenData = {};
     let analyzed = 0, errors = 0, filtered = 0;
-
     let tokens = [];
     
     try {
@@ -544,7 +543,7 @@ app.get('/', (req, res) => {
       test: '/api/telegram/test'
     },
     stats: { tracked: trackedWallets.size, clusters: walletClusters.size, alerts: activeAlerts.size },
-    features: ['Elite discovery', 'Realized + Unrealized PNL', 'Wallet clusters', 'Real-time monitoring', 'Telegram alerts', 'Birdeye fallback when DexScreener fails']
+    features: ['Elite discovery', 'Realized + Unrealized PNL', 'Wallet clusters', 'Real-time monitoring', 'Telegram alerts', 'Birdeye fallback']
   });
 });
 

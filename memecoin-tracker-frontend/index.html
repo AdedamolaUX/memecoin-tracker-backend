@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Low Cap Hunter - Successful Memecoin Traders</title>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #0f0f0f; color: #e0e0e0; margin: 0; padding: 20px; }
+    h1 { color: #00ff99; text-align: center; }
+    .container { max-width: 1200px; margin: auto; }
+    .controls { text-align: center; margin: 20px 0; }
+    button { background: #00ff99; color: black; border: none; padding: 12px 24px; font-size: 1.1em; cursor: pointer; border-radius: 8px; font-weight: bold; }
+    button:hover { background: #00cc77; }
+    label { font-size: 1.1em; margin: 0 10px; }
+    input[type="range"] { width: 200px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #1a1a1a; }
+    th, td { padding: 14px; text-align: left; border-bottom: 1px solid #333; }
+    th { background: #222; color: #00ff99; }
+    tr:hover { background: #252525; }
+    a { color: #00ff99; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .score { font-weight: bold; color: #00ff99; }
+    .early { color: #ffaa00; font-weight: bold; }
+    .loading { text-align: center; padding: 60px; font-size: 1.5em; color: #888; }
+    .footer { text-align: center; margin-top: 40px; color: #666; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Low Cap Hunter</h1>
+    <p style="text-align:center;">Discover successful memecoin traders — early snipers and consistent winners on Solana.</p>
+    
+    <div class="controls">
+      <label for="limit">Tokens Analyzed: <span id="limitValue">50</span></label>
+      <input type="range" id="limit" min="20" max="100" value="50" step="10">
+      <button onclick="loadData()">Refresh & Discover Traders</button>
+    </div>
+    
+    <div id="loading" class="loading">Click "Refresh" to load latest successful traders...</div>
+    
+    <table id="results" style="display:none;">
+      <thead>
+        <tr>
+          <th>Rank</th>
+          <th>Wallet Address</th>
+          <th>Success Score</th>
+          <th>Early Buys (New Launches)</th>
+          <th>Total Tokens Traded</th>
+          <th>Positive Change Bonus</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+    
+    <div class="footer">
+      Data from DexScreener (new pairs) + Birdeye (token list) + Helius (transactions)<br>
+      Refresh anytime for fresh traders • Built with ❤️ for Solana degens
+    </div>
+  </div>
+
+  <script>
+    const API_URL = 'https://memecoin-tracker-backend.onrender.com/api/discover';
+
+    async function loadData() {
+      const loading = document.getElementById('loading');
+      const results = document.getElementById('results');
+      const tableBody = document.getElementById('tableBody');
+      const limit = document.getElementById('limit').value;
+      document.getElementById('limitValue').textContent = limit;
+      
+      loading.style.display = 'block';
+      results.style.display = 'none';
+      tableBody.innerHTML = '';
+      
+      try {
+        const response = await fetch(`${API_URL}?limit=${limit}`);
+        const data = await response.json();
+        
+        if (!data.success || data.discoveredWallets.length === 0) {
+          loading.textContent = data.message || 'No traders found. Try again soon!';
+          return;
+        }
+        
+        loading.style.display = 'none';
+        results.style.display = 'table';
+        
+        data.discoveredWallets.forEach(wallet => {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${wallet.rank}</td>
+            <td><a href="https://solscan.io/account/${wallet.address}" target="_blank">${wallet.address.slice(0,8)}...${wallet.address.slice(-6)}</a></td>
+            <td class="score">${wallet.successScore}</td>
+            <td class="early">${wallet.earlyBuys}</td>
+            <td>${wallet.totalTokensTraded}</td>
+            <td>${wallet.positiveChangeBonus}</td>
+          `;
+          tableBody.appendChild(row);
+        });
+      } catch (err) {
+        loading.textContent = 'Error loading data. Check connection or try again.';
+        console.error(err);
+      }
+    }
+
+    // Load on start
+    window.onload = loadData;
+
+    // Update slider value display
+    document.getElementById('limit').addEventListener('input', function() {
+      document.getElementById('limitValue').textContent = this.value;
+    });
+  </script>
+</body>
+</html>
