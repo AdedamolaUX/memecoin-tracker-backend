@@ -87,18 +87,33 @@ async function getWalletBalances(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/balances?api-key=${HELIUS_API_KEY}`);
     const data = await res.json();
+    
+    if (data && data.error) {
+      console.error('Helius balance error:', data.error);
+      return [];
+    }
+    
     if (!data || !data.tokens) return [];
     return data.tokens.map(t => ({
       mint: t.mint,
       amount: t.amount / Math.pow(10, t.decimals || 9)
     }));
-  } catch { return []; }
+  } catch (e) { 
+    console.error('Balance fetch error:', e.message);
+    return []; 
+  }
 }
 
 async function findFunding(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
     const txs = await res.json();
+    
+    if (txs && txs.error) {
+      console.error('Helius funding error:', txs.error);
+      return null;
+    }
+    
     if (!Array.isArray(txs)) return null;
     const deps = {};
     txs.forEach(tx => {
@@ -112,13 +127,22 @@ async function findFunding(addr) {
     const sorted = Object.entries(deps).sort((a, b) => b[1] - a[1]);
     if (sorted.length === 0 || BLACKLISTED.has(sorted[0][0])) return null;
     return { fundingWallet: sorted[0][0], totalFunded: sorted[0][1] };
-  } catch { return null; }
+  } catch (e) { 
+    console.error('Funding search error:', e.message);
+    return null; 
+  }
 }
 
 async function findCluster(funding) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${funding}/transactions?api-key=${HELIUS_API_KEY}&limit=200`);
     const txs = await res.json();
+    
+    if (txs && txs.error) {
+      console.error('Helius cluster error:', txs.error);
+      return [];
+    }
+    
     if (!Array.isArray(txs)) return [];
     const wallets = new Set();
     txs.forEach(tx => {
@@ -127,13 +151,22 @@ async function findCluster(funding) {
       });
     });
     return Array.from(wallets);
-  } catch { return []; }
+  } catch (e) { 
+    console.error('Cluster search error:', e.message);
+    return []; 
+  }
 }
 
 async function analyzeProfit(addr) {
   try {
     const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=50`);
     const txs = await res.json();
+    
+    if (txs && txs.error) {
+      console.error('Helius profit error:', txs.error);
+      return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
+    }
+    
     if (!Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
     
     let solIn = 0, solOut = 0;
@@ -162,7 +195,7 @@ async function analyzeProfit(addr) {
     let unrealizedPNL = 0;
     const balances = await getWalletBalances(addr);
     
-    for (const balance of balances) {
+    for (const balance of balances.slice(0, 5)) {
       if (balance.mint === 'So11111111111111111111111111111111111111112') continue;
       const priceInSOL = await getTokenPriceInSOL(balance.mint);
       const currentValueInSOL = balance.amount * priceInSOL;
@@ -171,7 +204,7 @@ async function analyzeProfit(addr) {
       } else {
         unrealizedPNL += currentValueInSOL;
       }
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 300));
     }
     
     const totalProfit = realizedProfit + unrealizedPNL;
@@ -275,10 +308,24 @@ app.get('/api/discover', async (req, res) => {
       tokenData[mint] = { symbol: token.baseToken.symbol, change24h: token.priceChange?.h24 || 0 };
       
       try {
+        console.log(`Fetching txs for ${token.baseToken.symbol}...`);
         const txRes = await fetch(`https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
         const txs = await txRes.json();
-        if (!Array.isArray(txs) || txs.length === 0) { errors++; continue; }
         
+        if (txs && txs.error) {
+          console.error(`Helius error for ${token.baseToken.symbol}:`, txs.error);
+          errors++;
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        
+        if (!Array.isArray(txs) || txs.length === 0) { 
+          console.log(`No txs for ${token.baseToken.symbol}`);
+          errors++; 
+          continue; 
+        }
+        
+        console.log(`  ✅ ${token.baseToken.symbol}: ${txs.length} txs`);
         analyzed++;
         const buyers = new Map();
         
@@ -289,6 +336,8 @@ app.get('/api/discover', async (req, res) => {
             }
           });
         });
+        
+        console.log(`  👥 Found ${buyers.size} buyers`);
         
         const sorted = Array.from(buyers.entries()).sort((a, b) => a[1] - b[1]);
         sorted.forEach(([wallet, ts], i) => {
@@ -310,8 +359,11 @@ app.get('/api/discover', async (req, res) => {
           w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf });
         });
         
-        await new Promise(r => setTimeout(r, 800));
-      } catch { errors++; }
+        await new Promise(r => setTimeout(r, 1200));
+      } catch (e) { 
+        console.error(`Error processing token:`, e.message);
+        errors++; 
+      }
     }
 
     console.log(`Found ${Object.keys(scores).length} wallets`);
@@ -351,7 +403,7 @@ app.get('/api/discover', async (req, res) => {
       w.clusterSize = cluster.length;
       
       elite.push(w);
-      await new Promise(r => setTimeout(r, 1500));
+      await new Promise(r => setTimeout(r, 2000));
       if (elite.length >= top) break;
     }
 
@@ -448,10 +500,10 @@ app.post('/api/telegram/test', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v3.1 - Unrealized PNL',
+    status: 'Elite Tracker v3.1 - Unrealized PNL (50 token max)',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
-      discover: '/api/discover?limit=40&top=10&alert=true&minProfit=0.1',
+      discover: '/api/discover?limit=50&top=10&alert=true&minProfit=0.1',
       track: 'POST /api/track/:address',
       untrack: 'DELETE /api/track/:address',
       tracked: '/api/tracked',
@@ -460,7 +512,7 @@ app.get('/', (req, res) => {
       test: '/api/telegram/test'
     },
     stats: { tracked: trackedWallets.size, clusters: walletClusters.size, alerts: activeAlerts.size },
-    features: ['Elite discovery (>0.1 SOL total)', 'Realized + Unrealized PNL', 'Wallet clusters', 'Real-time monitoring', 'Telegram alerts']
+    features: ['Elite discovery (>0.1 SOL)', 'Realized + Unrealized PNL', 'Wallet clusters', 'Real-time monitoring', 'Telegram alerts', 'Max 50 tokens', 'Better error handling']
   });
 });
 
@@ -468,5 +520,6 @@ loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
   console.log('🚀 Elite Tracker v3.1 on port', PORT);
   console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
-  console.log('💼 Unrealized PNL: ✅');
+  console.log('💼 Max tokens: 50');
+  console.log('⏱️ Slower rate limit protection: ✅');
 });
