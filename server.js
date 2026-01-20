@@ -291,48 +291,78 @@ app.get('/api/discover', async (req, res) => {
     let tokens = [];
     
     try {
-      console.log('Fetching from DexScreener...');
-      const dexRes = await fetch('https://api.dexscreener.com/latest/dex/search?q=solana&chain=solana');
+      console.log('🔍 Method 1: Trying DexScreener...');
+      const dexRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/solana', {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
       const text = await dexRes.text();
+      console.log(`DexScreener status: ${dexRes.status}, preview: ${text.substring(0, 100)}`);
       
-      if (text.startsWith('<!DOCTYPE') || text.startsWith('<')) {
-        console.error('DexScreener returned HTML (rate limited). Using Birdeye fallback...');
-        
+      if (!text.startsWith('<!DOCTYPE') && !text.startsWith('<')) {
+        const dexData = JSON.parse(text);
+        if (dexData.pairs && dexData.pairs.length > 0) {
+          tokens = dexData.pairs.filter(p => p.chainId === 'solana').slice(0, limit);
+          console.log(`✅ DexScreener: ${tokens.length} tokens`);
+        }
+      }
+    } catch (e) {
+      console.error('❌ DexScreener failed:', e.message);
+    }
+
+    if (tokens.length === 0) {
+      try {
+        console.log('🔍 Method 2: Trying Birdeye...');
         const birdeyeRes = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hChangePercent&sort_type=desc&offset=0&limit=${limit}`, {
           headers: {
             'X-API-KEY': BIRDEYE_API_KEY,
             'x-chain': 'solana'
           }
         });
+        console.log(`Birdeye status: ${birdeyeRes.status}`);
         const birdeyeData = await birdeyeRes.json();
+        console.log('Birdeye response:', JSON.stringify(birdeyeData).substring(0, 200));
         
         if (birdeyeData.data && birdeyeData.data.tokens) {
           tokens = birdeyeData.data.tokens.map(t => ({
             baseToken: { address: t.address, symbol: t.symbol },
             priceChange: { h24: t.v24hChangePercent || 0 }
           })).slice(0, limit);
-          console.log(`✅ Using Birdeye: ${tokens.length} tokens`);
+          console.log(`✅ Birdeye: ${tokens.length} tokens`);
         }
-      } else {
-        const dexData = JSON.parse(text);
-        tokens = (dexData.pairs || []).filter(p => p.chainId === 'solana').slice(0, limit);
-        console.log(`✅ Using DexScreener: ${tokens.length} tokens`);
+      } catch (e) {
+        console.error('❌ Birdeye failed:', e.message);
       }
-    } catch (e) {
-      console.error('Token fetch error:', e.message);
-      return res.status(500).json({ error: 'Failed to fetch tokens from both DexScreener and Birdeye', details: e.message });
+    }
+
+    if (tokens.length === 0) {
+      try {
+        console.log('🔍 Method 3: Trying Jupiter...');
+        const jupRes = await fetch('https://token.jup.ag/strict');
+        const jupTokens = await jupRes.json();
+        console.log(`Jupiter: ${jupTokens.length} tokens`);
+        
+        tokens = jupTokens.slice(0, limit).map(t => ({
+          baseToken: { address: t.address, symbol: t.symbol },
+          priceChange: { h24: 0 }
+        }));
+        console.log(`✅ Jupiter: ${tokens.length} tokens`);
+      } catch (e) {
+        console.error('❌ Jupiter failed:', e.message);
+      }
     }
     
     if (tokens.length === 0) {
+      console.error('💥 ALL METHODS FAILED');
       return res.json({
-        success: true,
+        success: false,
         discoveredWallets: [],
         stats: { tokensAnalyzed: 0, walletsScanned: 0, eliteWalletsFound: 0, heliusErrors: 0, filteredLowProfit: 0 },
-        error: 'No tokens found from any source'
+        error: 'No tokens from DexScreener, Birdeye, or Jupiter',
+        debug: { dexScreenerTried: true, birdeyeTried: true, jupiterTried: true }
       });
     }
 
-    console.log(`Analyzing ${tokens.length} tokens...`);
+    console.log(`✅ Got ${tokens.length} tokens, analyzing...`);
 
     for (const token of tokens) {
       const mint = token.baseToken.address;
@@ -484,7 +514,7 @@ app.get('/api/discover', async (req, res) => {
     });
   } catch (error) {
     console.error('Discovery error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message, stack: error.stack });
   }
 });
 
@@ -531,7 +561,7 @@ app.post('/api/telegram/test', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v3.2 - DexScreener + Birdeye Fallback',
+    status: 'Elite Tracker v3.3 - Triple Fallback',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
       discover: '/api/discover?limit=50&top=10&alert=true&minProfit=0.1',
@@ -543,13 +573,13 @@ app.get('/', (req, res) => {
       test: '/api/telegram/test'
     },
     stats: { tracked: trackedWallets.size, clusters: walletClusters.size, alerts: activeAlerts.size },
-    features: ['Elite discovery', 'Realized + Unrealized PNL', 'Wallet clusters', 'Real-time monitoring', 'Telegram alerts', 'Birdeye fallback']
+    features: ['DexScreener → Birdeye → Jupiter fallback', 'Detailed error logging', 'Realized + Unrealized PNL', 'Wallet clusters', 'Telegram alerts']
   });
 });
 
 loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v3.2 on port', PORT);
+  console.log('🚀 Elite Tracker v3.3 on port', PORT);
   console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
-  console.log('🔄 Birdeye fallback: ✅');
+  console.log('🔄 Triple fallback: DexScreener → Birdeye → Jupiter');
 });
