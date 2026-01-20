@@ -18,6 +18,10 @@ const trackedWallets = new Map();
 const walletClusters = new Map();
 const activeAlerts = new Map();
 
+// Request queue to prevent multiple discoveries at once
+let isDiscovering = false;
+const discoveryQueue = [];
+
 const BLACKLISTED = new Set([
   'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
   'JUP2jxvXaqu7NQY1GmNF4m1vodw12LVXYxbFL2uJvfo', '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
@@ -524,6 +528,10 @@ app.get('/api/discover', async (req, res) => {
   } catch (error) {
     console.error('Discovery error:', error);
     res.status(500).json({ error: error.message, stack: error.stack });
+  } finally {
+    // Always release the lock
+    isDiscovering = false;
+    console.log('=== DISCOVERY COMPLETE - Lock released ===');
   }
 });
 
