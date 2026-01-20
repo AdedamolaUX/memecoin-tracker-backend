@@ -277,13 +277,14 @@ function getTier(p) {
 
 app.get('/api/discover', async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 40, 50);
+    const limit = Math.min(parseInt(req.query.limit) || 20, 30); // Reduced from 40/50
     const top = Math.min(parseInt(req.query.top) || 10, 20);
     const minProfit = parseFloat(req.query.minProfit) || 0.1;
     const alert = req.query.alert === 'true';
 
     console.log('=== DISCOVERY START ===');
     console.log('Params:', { limit, top, minProfit, alert });
+    console.log('⚠️ Using SLOW rate limiting (3s per request) to avoid Helius limits');
 
     const scores = {};
     const tokenData = {};
@@ -362,26 +363,34 @@ app.get('/api/discover', async (req, res) => {
       });
     }
 
-    console.log(`✅ Got ${tokens.length} tokens, analyzing...`);
+    console.log(`✅ Got ${tokens.length} tokens, analyzing with SLOW rate limiting...`);
 
     for (const token of tokens) {
       const mint = token.baseToken.address;
       tokenData[mint] = { symbol: token.baseToken.symbol, change24h: token.priceChange?.h24 || 0 };
       
       try {
-        console.log(`Fetching txs for ${token.baseToken.symbol}...`);
+        console.log(`[${analyzed + 1}/${tokens.length}] Fetching txs for ${token.baseToken.symbol}...`);
+        
+        // WAIT 3 SECONDS before each request to avoid rate limit
+        await new Promise(r => setTimeout(r, 3000));
+        
         const txRes = await fetch(`https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
         const txs = await txRes.json();
         
         if (txs && txs.error) {
-          console.error(`Helius error for ${token.baseToken.symbol}:`, txs.error);
+          console.error(`  ❌ Helius error for ${token.baseToken.symbol}:`, txs.error);
           errors++;
-          await new Promise(r => setTimeout(r, 2000));
+          // If rate limited, wait even longer
+          if (txs.error.code === -32429) {
+            console.log('  ⏸️ Rate limited! Waiting 10 seconds...');
+            await new Promise(r => setTimeout(r, 10000));
+          }
           continue;
         }
         
         if (!Array.isArray(txs) || txs.length === 0) { 
-          console.log(`No txs for ${token.baseToken.symbol}`);
+          console.log(`  ⚠️ No txs for ${token.baseToken.symbol}`);
           errors++; 
           continue; 
         }
@@ -420,9 +429,9 @@ app.get('/api/discover', async (req, res) => {
           w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf });
         });
         
-        await new Promise(r => setTimeout(r, 1200));
+        // No additional delay needed here since we already waited 3 seconds above
       } catch (e) { 
-        console.error(`Error processing token:`, e.message);
+        console.error(`  ❌ Error processing token:`, e.message);
         errors++; 
       }
     }
