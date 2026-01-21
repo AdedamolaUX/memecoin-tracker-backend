@@ -9,9 +9,14 @@ app.use(cors());
 app.use(express.json());
 
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
-const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
+const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407'; // Backup
+const QUICKNODE_URL = process.env.QUICKNODE_URL || ''; // Add via Render env vars
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+// Use QuickNode if available, fallback to Helius
+const useQuickNode = !!QUICKNODE_URL;
+console.log('🔌 Using:', useQuickNode ? 'QuickNode' : 'Helius');
 
 let tokenCache = {};
 const trackedWallets = new Map();
@@ -87,34 +92,118 @@ async function getTokenPriceInSOL(tokenMint) {
   } catch { return 0; }
 }
 
+async function getWalletTransactions(address, limit = 100) {
+  if (useQuickNode) {
+    try {
+      const response = await fetch(QUICKNODE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getSignaturesForAddress',
+          params: [address, { limit }]
+        })
+      });
+      const data = await response.json();
+      
+      if (data.error) {
+        console.error('QuickNode error:', data.error);
+        return null;
+      }
+      
+      // QuickNode returns signatures, we need to get transaction details
+      const signatures = data.result || [];
+      if (signatures.length === 0) return [];
+      
+      // Get full transaction details for first few signatures
+      const txPromises = signatures.slice(0, Math.min(limit, 50)).map(sig => 
+        fetch(QUICKNODE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTransaction',
+            params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+          })
+        }).then(r => r.json())
+      );
+      
+      const txResults = await Promise.all(txPromises);
+      return txResults.map(r => r.result).filter(Boolean);
+      
+    } catch (e) {
+      console.error('QuickNode fetch error:', e.message);
+      return null;
+    }
+  } else {
+    // Fallback to Helius
+    try {
+      const res = await fetch(`https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=${limit}`);
+      return await res.json();
+    } catch (e) {
+      console.error('Helius fetch error:', e.message);
+      return null;
+    }
+  }
+}
+
 async function getWalletBalances(addr) {
-  try {
-    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/balances?api-key=${HELIUS_API_KEY}`);
-    const data = await res.json();
-    if (data && data.error) {
-      console.error('Helius balance error:', data.error);
+  if (useQuickNode) {
+    try {
+      const response = await fetch(QUICKNODE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTokenAccountsByOwner',
+          params: [
+            addr,
+            { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+            { encoding: 'jsonParsed' }
+          ]
+        })
+      });
+      const data = await response.json();
+      
+      if (data.error || !data.result) return [];
+      
+      return data.result.value.map(account => ({
+        mint: account.account.data.parsed.info.mint,
+        amount: account.account.data.parsed.info.tokenAmount.uiAmount
+      }));
+    } catch (e) {
+      console.error('QuickNode balance error:', e.message);
       return [];
     }
-    if (!data || !data.tokens) return [];
-    return data.tokens.map(t => ({
-      mint: t.mint,
-      amount: t.amount / Math.pow(10, t.decimals || 9)
-    }));
-  } catch (e) { 
-    console.error('Balance fetch error:', e.message);
-    return []; 
+  } else {
+    // Original Helius code
+    try {
+      const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/balances?api-key=${HELIUS_API_KEY}`);
+      const data = await res.json();
+      if (data && data.error) {
+        console.error('Helius balance error:', data.error);
+        return [];
+      }
+      if (!data || !data.tokens) return [];
+      return data.tokens.map(t => ({
+        mint: t.mint,
+        amount: t.amount / Math.pow(10, t.decimals || 9)
+      }));
+    } catch (e) { 
+      console.error('Balance fetch error:', e.message);
+      return []; 
+    }
   }
 }
 
 async function findFunding(addr) {
+  const txs = await getWalletTransactions(addr, 100);
+  if (!txs || !Array.isArray(txs)) return null;
+  
   try {
-    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
-    const txs = await res.json();
-    if (txs && txs.error) {
-      console.error('Helius funding error:', txs.error);
-      return null;
-    }
-    if (!Array.isArray(txs)) return null;
     const deps = {};
     txs.forEach(tx => {
       if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
@@ -134,14 +223,10 @@ async function findFunding(addr) {
 }
 
 async function findCluster(funding) {
+  const txs = await getWalletTransactions(funding, 200);
+  if (!txs || !Array.isArray(txs)) return [];
+  
   try {
-    const res = await fetch(`https://api.helius.xyz/v0/addresses/${funding}/transactions?api-key=${HELIUS_API_KEY}&limit=200`);
-    const txs = await res.json();
-    if (txs && txs.error) {
-      console.error('Helius cluster error:', txs.error);
-      return [];
-    }
-    if (!Array.isArray(txs)) return [];
     const wallets = new Set();
     txs.forEach(tx => {
       if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
@@ -156,15 +241,10 @@ async function findCluster(funding) {
 }
 
 async function analyzeProfit(addr) {
+  const txs = await getWalletTransactions(addr, 50);
+  if (!txs || !Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
+  
   try {
-    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=50`);
-    const txs = await res.json();
-    if (txs && txs.error) {
-      console.error('Helius profit error:', txs.error);
-      return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
-    }
-    if (!Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
-    
     let solIn = 0, solOut = 0;
     const tokensBought = {};
     
@@ -218,10 +298,10 @@ async function analyzeProfit(addr) {
 }
 
 async function monitorWallet(addr) {
+  const txs = await getWalletTransactions(addr, 5);
+  if (!txs || !Array.isArray(txs) || txs.length === 0) return null;
+  
   try {
-    const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/transactions?api-key=${HELIUS_API_KEY}&limit=5`);
-    const txs = await res.json();
-    if (!Array.isArray(txs) || txs.length === 0) return null;
     const tx = txs[0];
     const lastSeen = activeAlerts.get(addr)?.timestamp || 0;
     if (tx.timestamp <= lastSeen) return null;
@@ -377,10 +457,9 @@ app.get('/api/discover', async (req, res) => {
         console.log(`[${analyzed + 1}/${tokens.length}] Fetching txs for ${token.baseToken.symbol}...`);
         
         // WAIT 3 SECONDS before each request to avoid rate limit
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, useQuickNode ? 1000 : 3000));
         
-        const txRes = await fetch(`https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${HELIUS_API_KEY}&limit=100`);
-        const txs = await txRes.json();
+        const txs = await getWalletTransactions(mint, 100);
         
         if (txs && txs.error) {
           console.error(`  ❌ Helius error for ${token.baseToken.symbol}:`, txs.error);
