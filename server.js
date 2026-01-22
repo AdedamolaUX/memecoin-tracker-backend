@@ -112,11 +112,10 @@ async function getWalletTransactions(address, limit = 100) {
         return null;
       }
       
-      // QuickNode returns signatures, we need to get transaction details
       const signatures = data.result || [];
       if (signatures.length === 0) return [];
       
-      // Get full transaction details for first few signatures
+      // Get full transaction details
       const txPromises = signatures.slice(0, Math.min(limit, 50)).map(sig => 
         fetch(QUICKNODE_URL, {
           method: 'POST',
@@ -131,7 +130,58 @@ async function getWalletTransactions(address, limit = 100) {
       );
       
       const txResults = await Promise.all(txPromises);
-      return txResults.map(r => r.result).filter(Boolean);
+      
+      // Convert QuickNode format to Helius-like format
+      return txResults.map(r => {
+        if (!r.result) return null;
+        const tx = r.result;
+        
+        // Parse token transfers from instructions
+        const tokenTransfers = [];
+        const nativeTransfers = [];
+        
+        if (tx.meta && tx.meta.postTokenBalances && tx.meta.preTokenBalances) {
+          // Detect token transfers from balance changes
+          tx.meta.postTokenBalances.forEach(post => {
+            const pre = tx.meta.preTokenBalances.find(p => p.accountIndex === post.accountIndex);
+            const preAmount = pre ? parseFloat(pre.uiTokenAmount.uiAmountString || '0') : 0;
+            const postAmount = parseFloat(post.uiTokenAmount.uiAmountString || '0');
+            
+            if (postAmount !== preAmount) {
+              const accounts = tx.transaction.message.accountKeys;
+              tokenTransfers.push({
+                mint: post.mint,
+                toUserAccount: accounts[post.accountIndex]?.pubkey || '',
+                fromUserAccount: accounts[pre?.accountIndex || 0]?.pubkey || '',
+                tokenAmount: Math.abs(postAmount - preAmount)
+              });
+            }
+          });
+        }
+        
+        // Parse SOL transfers
+        if (tx.meta && tx.meta.postBalances && tx.meta.preBalances) {
+          tx.meta.postBalances.forEach((post, idx) => {
+            const pre = tx.meta.preBalances[idx] || 0;
+            if (post !== pre) {
+              const accounts = tx.transaction.message.accountKeys;
+              nativeTransfers.push({
+                fromUserAccount: accounts[idx]?.pubkey || '',
+                toUserAccount: accounts[idx]?.pubkey || '',
+                amount: Math.abs(post - pre)
+              });
+            }
+          });
+        }
+        
+        return {
+          signature: tx.transaction.signatures[0],
+          timestamp: tx.blockTime,
+          type: tokenTransfers.length > 0 ? 'SWAP' : 'TRANSFER',
+          tokenTransfers,
+          nativeTransfers
+        };
+      }).filter(Boolean);
       
     } catch (e) {
       console.error('QuickNode fetch error:', e.message);
