@@ -292,14 +292,20 @@ async function findCluster(funding) {
 
 async function analyzeProfit(addr) {
   const txs = await getWalletTransactions(addr, 50);
-  if (!txs || !Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
+  if (!txs || !Array.isArray(txs)) {
+    console.log(`  ⚠️ No transactions returned for profit analysis`);
+    return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
+  }
+  
+  console.log(`  📊 Analyzing ${txs.length} transactions...`);
   
   try {
-    let solIn = 0, solOut = 0;
+    let solIn = 0, solOut = 0, swapCount = 0;
     const tokensBought = {};
     
-    txs.forEach(tx => {
+    txs.forEach((tx, idx) => {
       if (tx.type === 'SWAP' && tx.nativeTransfers && tx.tokenTransfers) {
+        swapCount++;
         tx.nativeTransfers.forEach(t => {
           const amt = t.amount / 1e9;
           if (t.fromUserAccount === addr) solIn += amt;
@@ -317,21 +323,14 @@ async function analyzeProfit(addr) {
       }
     });
     
+    console.log(`  💰 SOL: In=${solIn.toFixed(3)}, Out=${solOut.toFixed(3)}, Swaps=${swapCount}`);
+    
     const realizedProfit = solOut - solIn;
     let unrealizedPNL = 0;
-    const balances = await getWalletBalances(addr);
     
-    for (const balance of balances.slice(0, 5)) {
-      if (balance.mint === 'So11111111111111111111111111111111111111112') continue;
-      const priceInSOL = await getTokenPriceInSOL(balance.mint);
-      const currentValueInSOL = balance.amount * priceInSOL;
-      if (tokensBought[balance.mint]) {
-        unrealizedPNL += (currentValueInSOL - tokensBought[balance.mint].costInSOL);
-      } else {
-        unrealizedPNL += currentValueInSOL;
-      }
-      await new Promise(r => setTimeout(r, 300));
-    }
+    // Skip unrealized PNL for now to speed up testing
+    // const balances = await getWalletBalances(addr);
+    // ... balance checking code ...
     
     const totalProfit = realizedProfit + unrealizedPNL;
     return { 
@@ -342,7 +341,7 @@ async function analyzeProfit(addr) {
       profitMargin: solIn > 0 ? (totalProfit / solIn) * 100 : 0 
     };
   } catch (e) { 
-    console.error('Profit analysis error:', e.message);
+    console.error('  ❌ Profit analysis error:', e.message);
     return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 }; 
   }
 }
@@ -577,11 +576,20 @@ app.get('/api/discover', async (req, res) => {
       .sort((a, b) => (b.earlyEntryScore + b.successScore) - (a.earlyEntryScore + a.successScore))
       .slice(0, top * 2);
     
+    console.log(`Filtered to ${candidates.length} candidates (removed bots, need 2+ tokens)`);
+    
     const elite = [];
     for (const w of candidates) {
-      console.log(`Checking ${w.address.slice(0, 8)}...`);
+      console.log(`Checking ${w.address.slice(0, 8)}... (${w.totalTokens} tokens, score: ${w.earlyEntryScore + w.successScore})`);
       
       const profit = await analyzeProfit(w.address);
+      
+      console.log(`  Profit result:`, {
+        isProfitable: profit.isProfitable,
+        total: profit.totalProfit.toFixed(3),
+        realized: profit.realizedProfit.toFixed(3),
+        unrealized: profit.unrealizedPNL.toFixed(3)
+      });
       if (!profit.isProfitable || profit.totalProfit < minProfit) {
         filtered++;
         console.log(`  ❌ Total: ${profit.totalProfit.toFixed(3)} SOL`);
