@@ -534,7 +534,9 @@ app.get('/api/discover', async (req, res) => {
         txs.forEach(tx => {
           if (tx.tokenTransfers) tx.tokenTransfers.forEach(t => {
             if (t.mint === mint && t.toUserAccount && !BLACKLISTED.has(t.toUserAccount) && !isProgram(t.toUserAccount)) {
-              if (!buyers.has(t.toUserAccount)) buyers.set(t.toUserAccount, tx.timestamp);
+              if (!buyers.has(t.toUserAccount)) {
+                buyers.set(t.toUserAccount, tx.timestamp);
+              }
             }
           });
         });
@@ -543,10 +545,20 @@ app.get('/api/discover', async (req, res) => {
         
         const sorted = Array.from(buyers.entries()).sort((a, b) => a[1] - b[1]);
         sorted.forEach(([wallet, ts], i) => {
-          if (!scores[wallet]) scores[wallet] = { address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, earlyBuyCount: 0, lastActivity: 0, tokensFound: [] };
+          if (!scores[wallet]) {
+            scores[wallet] = { 
+              address: wallet, 
+              earlyEntryScore: 0, 
+              successScore: 0, 
+              totalTokens: 0, 
+              earlyBuyCount: 0, 
+              lastActivity: 0, 
+              tokensFound: [] 
+            };
+          }
           
           const w = scores[wallet];
-          w.totalTokens++;
+          w.totalTokens++; // INCREMENT FOR EACH TOKEN
           w.lastActivity = Math.max(w.lastActivity, ts);
           
           const percentile = ((i + 1) / sorted.length) * 100;
@@ -569,10 +581,27 @@ app.get('/api/discover', async (req, res) => {
     }
 
     console.log(`Found ${Object.keys(scores).length} wallets`);
+    
+    // Debug: Show sample wallets
+    const sampleWallets = Object.values(scores).slice(0, 5);
+    console.log('Sample wallets:', sampleWallets.map(w => ({
+      addr: w.address.slice(0, 8),
+      tokens: w.totalTokens,
+      lastActivity: new Date(w.lastActivity * 1000).toISOString(),
+      isBot: isBot(w)
+    })));
+    
     console.log('Analyzing profitability...');
 
     const candidates = Object.values(scores)
-      .filter(w => !isBot(w) && w.totalTokens >= 2)
+      .filter(w => {
+        const botCheck = isBot(w);
+        const tokenCheck = w.totalTokens >= 2;
+        if (!tokenCheck || botCheck) {
+          console.log(`Filtered out ${w.address.slice(0, 8)}: tokens=${w.totalTokens}, isBot=${botCheck}`);
+        }
+        return !botCheck && tokenCheck;
+      })
       .sort((a, b) => (b.earlyEntryScore + b.successScore) - (a.earlyEntryScore + a.successScore))
       .slice(0, top * 2);
     
