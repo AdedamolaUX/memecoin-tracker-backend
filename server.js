@@ -566,12 +566,12 @@ app.get('/api/discover', async (req, res) => {
           else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
           
           const perf = tokenData[mint].change24h;
-          if (perf > 100) w.successScore += 15;
-          else if (perf > 50) w.successScore += 10;
-          else if (perf > 20) w.successScore += 5;
-          
-          w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf });
-        });
+	if (perf > 100) w.successScore += 15;
+	else if (perf > 50) w.successScore += 10;
+	else if (perf > 20) w.successScore += 5;
+
+	w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf });
+	console.log(`  🔝 TESTING - Token count working`);
         
         // No additional delay needed here since we already waited 3 seconds above
       } catch (e) { 
