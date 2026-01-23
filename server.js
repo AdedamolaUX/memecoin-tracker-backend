@@ -397,13 +397,14 @@ app.get('/api/discover', async (req, res) => {
             scores[wallet] = { address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, earlyBuyCount: 0, lastActivity: 0, tokensFound: [] };
           }
           
-          const w = scores[wallet];
-          w.totalTokens++;
-          w.lastActivity = Math.max(w.lastActivity, ts);
-          
-          const percentile = ((i + 1) / sorted.length) * 100;
-          if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
-          else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
+         const w = scores[wallet];
+w.totalTokens++;
+w.lastActivity = Math.max(w.lastActivity, ts);
+console.log(`    DEBUG: Wallet ${wallet.slice(0,8)} now has ${w.totalTokens} tokens (was ${w.totalTokens - 1})`);
+
+const percentile = ((i + 1) / sorted.length) * 100;
+if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
+else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
           
           const perf = tokenData[mint].change24h;
           if (perf > 100) w.successScore += 15;
