@@ -47,7 +47,7 @@ async function sendTelegram(msg) {
 
 async function alertElite(w) {
   const ws = w.address.slice(0, 6) + '...' + w.address.slice(-4);
-  let msg = `💎 <b>ELITE WALLET #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n💰 ${w.totalProfit} SOL\n📊 Realized: ${w.realizedProfit} SOL\n💼 Unrealized: ${w.unrealizedPNL} SOL\n📈 ${w.profitMargin}%\n🎯 ${w.earlyBuys} early\n📊 ${w.totalTokensTraded} tokens\n`;
+  let msg = `💎 <b>ELITE WALLET #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n💰 ${w.totalProfit} SOL\n📊 Realized: ${w.realizedProfit} SOL\n📈 ${w.profitMargin}%\n🎯 ${w.earlyBuys} early\n📊 ${w.totalTokensTraded} tokens\n`;
   if (w.fundingWallet) msg += `\n👥 Cluster: <code>${w.fundingWallet.slice(0, 6)}...${w.fundingWallet.slice(-4)}</code> (${w.clusterSize})\n`;
   msg += `\n🔗 <a href="https://solscan.io/account/${w.address}">Solscan</a>`;
   await sendTelegram(msg);
@@ -122,10 +122,13 @@ async function getWalletTransactions(address, limit = 100) {
             const postAmount = parseFloat(post.uiTokenAmount.uiAmountString || '0');
             if (postAmount !== preAmount) {
               const accounts = tx.transaction.message.accountKeys;
+              const toAccount = accounts[post.accountIndex];
+              const fromAccount = accounts[pre?.accountIndex || 0];
+              
               tokenTransfers.push({
                 mint: post.mint,
-                toUserAccount: accounts[post.accountIndex]?.pubkey || '',
-                fromUserAccount: accounts[pre?.accountIndex || 0]?.pubkey || '',
+                toUserAccount: typeof toAccount === 'string' ? toAccount : (toAccount?.pubkey || ''),
+                fromUserAccount: typeof fromAccount === 'string' ? fromAccount : (fromAccount?.pubkey || ''),
                 tokenAmount: Math.abs(postAmount - preAmount)
               });
             }
@@ -137,9 +140,12 @@ async function getWalletTransactions(address, limit = 100) {
             const pre = tx.meta.preBalances[idx] || 0;
             if (post !== pre) {
               const accounts = tx.transaction.message.accountKeys;
+              const account = accounts[idx];
+              const accountStr = typeof account === 'string' ? account : (account?.pubkey || '');
+              
               nativeTransfers.push({
-                fromUserAccount: accounts[idx]?.pubkey || '',
-                toUserAccount: accounts[idx]?.pubkey || '',
+                fromUserAccount: accountStr,
+                toUserAccount: accountStr,
                 amount: Math.abs(post - pre)
               });
             }
@@ -383,8 +389,9 @@ app.get('/api/discover', async (req, res) => {
         const buyers = new Map();
         txs.forEach(tx => {
           if (tx.tokenTransfers) tx.tokenTransfers.forEach(t => {
-            if (t.mint === mint && t.toUserAccount && !BLACKLISTED.has(t.toUserAccount) && !isProgram(t.toUserAccount)) {
-              if (!buyers.has(t.toUserAccount)) buyers.set(t.toUserAccount, tx.timestamp);
+            const userAddr = t.toUserAccount;
+            if (t.mint === mint && userAddr && !BLACKLISTED.has(userAddr) && !isProgram(userAddr)) {
+              if (!buyers.has(userAddr)) buyers.set(userAddr, tx.timestamp);
             }
           });
         });
@@ -397,14 +404,13 @@ app.get('/api/discover', async (req, res) => {
             scores[wallet] = { address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, earlyBuyCount: 0, lastActivity: 0, tokensFound: [] };
           }
           
-         const w = scores[wallet];
-w.totalTokens++;
-w.lastActivity = Math.max(w.lastActivity, ts);
-console.log(`    DEBUG: Wallet ${wallet.slice(0,8)} now has ${w.totalTokens} tokens (was ${w.totalTokens - 1})`);
-
-const percentile = ((i + 1) / sorted.length) * 100;
-if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
-else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
+          const w = scores[wallet];
+          w.totalTokens++;
+          w.lastActivity = Math.max(w.lastActivity, ts);
+          
+          const percentile = ((i + 1) / sorted.length) * 100;
+          if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
+          else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
           
           const perf = tokenData[mint].change24h;
           if (perf > 100) w.successScore += 15;
@@ -542,21 +548,18 @@ app.post('/api/telegram/test', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v3.5 - QuickNode',
+    status: 'Elite Tracker v3.6 - FIXED QuickNode',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
       discover: '/api/discover?limit=20&top=5&alert=true',
       track: 'POST /api/track/:address',
       tracked: '/api/tracked',
-      alerts: '/api/alerts',
       test: '/api/telegram/test'
-    },
-    stats: { tracked: trackedWallets.size }
+    }
   });
 });
 
 loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v3.5 on port', PORT);
-  console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
+  console.log('🚀 Elite Tracker v3.6 - FIXED');
 });
