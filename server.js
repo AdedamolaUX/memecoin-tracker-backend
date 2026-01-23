@@ -62,6 +62,36 @@ async function alertTrade(a) {
   await sendTelegram(msg);
 }
 
+async function getTokenBuyers(tokenMint, limit = 100) {
+  try {
+    const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${tokenMint}&tx_type=swap&sort_type=desc&offset=0&limit=${limit}`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
+    });
+    const data = await res.json();
+    
+    if (!data.success || !data.data || !data.data.items) return [];
+    
+    const buyers = new Map();
+    data.data.items.forEach(tx => {
+      if (tx.owner && tx.from && tx.to) {
+        if (tx.to.address === tokenMint) {
+          const wallet = tx.owner;
+          const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
+          
+          if (!buyers.has(wallet)) {
+            buyers.set(wallet, timestamp);
+          }
+        }
+      }
+    });
+    
+    return Array.from(buyers.entries()).map(([wallet, timestamp]) => ({ wallet, timestamp }));
+  } catch (e) {
+    console.error(`  ❌ Birdeye txs error:`, e.message);
+    return [];
+  }
+}
+
 async function getTokenPriceInSOL(tokenMint) {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`);
@@ -378,35 +408,38 @@ app.get('/api/discover', async (req, res) => {
       
       try {
         console.log(`[${analyzed + 1}/${tokens.length}] ${token.baseToken.symbol}...`);
-        await new Promise(r => setTimeout(r, useQuickNode ? 1000 : 3000));
+        await new Promise(r => setTimeout(r, 500));
         
-        const txs = await getWalletTransactions(mint, 100);
-        if (!txs || !Array.isArray(txs) || txs.length === 0) continue;
+        const buyers = await getTokenBuyers(mint, 100);
         
-        console.log(`  ✅ ${txs.length} txs`);
+        if (buyers.length === 0) {
+          console.log(`  ⚠️ No buyers found`);
+          continue;
+        }
+        
+        console.log(`  👥 ${buyers.length} buyers`);
         analyzed++;
         
-        const buyers = new Map();
-        txs.forEach(tx => {
-          if (tx.tokenTransfers) tx.tokenTransfers.forEach(t => {
-            const userAddr = t.toUserAccount;
-            if (t.mint === mint && userAddr && !BLACKLISTED.has(userAddr) && !isProgram(userAddr)) {
-              if (!buyers.has(userAddr)) buyers.set(userAddr, tx.timestamp);
-            }
-          });
-        });
+        const sorted = buyers.sort((a, b) => a.timestamp - b.timestamp);
         
-        console.log(`  👥 ${buyers.size} buyers`);
-        
-        const sorted = Array.from(buyers.entries()).sort((a, b) => a[1] - b[1]);
-        sorted.forEach(([wallet, ts], i) => {
+        sorted.forEach(({ wallet, timestamp }, i) => {
+          if (BLACKLISTED.has(wallet) || isProgram(wallet)) return;
+          
           if (!scores[wallet]) {
-            scores[wallet] = { address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, earlyBuyCount: 0, lastActivity: 0, tokensFound: [] };
+            scores[wallet] = { 
+              address: wallet, 
+              earlyEntryScore: 0, 
+              successScore: 0, 
+              totalTokens: 0, 
+              earlyBuyCount: 0, 
+              lastActivity: 0, 
+              tokensFound: [] 
+            };
           }
           
           const w = scores[wallet];
           w.totalTokens++;
-          w.lastActivity = Math.max(w.lastActivity, ts);
+          w.lastActivity = Math.max(w.lastActivity, timestamp);
           
           const percentile = ((i + 1) / sorted.length) * 100;
           if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
@@ -421,19 +454,21 @@ app.get('/api/discover', async (req, res) => {
         });
         
         const topWallet = Object.values(scores).sort((a, b) => b.totalTokens - a.totalTokens)[0];
-        if (topWallet) console.log(`  🔝 Top: ${topWallet.totalTokens} tokens`);
+        if (topWallet) console.log(`  🔝 Top wallet: ${topWallet.totalTokens} tokens`);
         
-      } catch (e) {}
+      } catch (e) {
+        console.error(`  ❌ Error for ${token.baseToken.symbol}:`, e.message);
+      }
     }
 
-    console.log(`Found ${Object.keys(scores).length} wallets`);
+    console.log(`Found ${Object.keys(scores).length} unique wallets`);
     
     const candidates = Object.values(scores)
       .filter(w => !isBot(w) && w.totalTokens >= 2)
       .sort((a, b) => (b.earlyEntryScore + b.successScore) - (a.earlyEntryScore + a.successScore))
       .slice(0, top * 2);
     
-    console.log(`Candidates: ${candidates.length}`);
+    console.log(`Candidates (2+ tokens): ${candidates.length}`);
     
     const elite = [];
     for (const w of candidates) {
@@ -548,7 +583,7 @@ app.post('/api/telegram/test', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v3.6 - FIXED QuickNode',
+    status: 'Elite Tracker v3.7 - FIXED Buyer Discovery',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
       discover: '/api/discover?limit=20&top=5&alert=true',
@@ -561,5 +596,6 @@ app.get('/', (req, res) => {
 
 loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v3.6 - FIXED');
+  console.log('🚀 Elite Tracker v3.7 - FIXED Buyer Discovery');
+  console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
 });
