@@ -287,57 +287,40 @@ async function findCluster(funding) {
 }
 
 async function analyzeProfit(addr) {
-  const txs = await getWalletTransactions(addr, 50);
-  if (!txs || !Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
-  
   try {
+    // Use Birdeye to get wallet transaction history - more reliable than QuickNode
+    const res = await fetch(`https://public-api.birdeye.so/v1/wallet/tx_list?wallet=${addr}&limit=50&tx_type=swap`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+    });
+    const data = await res.json();
+    
+    if (!data.success || !data.data || !data.data.items) {
+      console.log(`    ⚠️ No Birdeye tx data for wallet`);
+      return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
+    }
+    
     let solSpent = 0;
     let solReceived = 0;
-    let swapCount = 0;
-    let debugCount = 0;
+    const txs = data.data.items;
     
     txs.forEach(tx => {
-      if (tx.type !== 'SWAP' || !tx.tokenTransfers || tx.tokenTransfers.length === 0) return;
-      
-      swapCount++;
-      
-      // Debug first 2 swaps to see the structure
-      if (debugCount < 2) {
-        console.log(`    🔍 SWAP ${debugCount + 1}:`);
-        console.log(`      Token transfers:`, tx.tokenTransfers.map(t => ({ 
-          mint: t.mint?.slice(0, 8), 
-          to: t.toUserAccount?.slice(0, 8), 
-          from: t.fromUserAccount?.slice(0, 8) 
-        })));
-        console.log(`      Native transfers:`, tx.nativeTransfers?.map(t => ({ 
-          to: t.toUserAccount?.slice(0, 8), 
-          from: t.fromUserAccount?.slice(0, 8),
-          amt: (t.amount / 1e9).toFixed(3)
-        })));
-        debugCount++;
-      }
-      
-      const boughtTokens = tx.tokenTransfers.filter(t => t.toUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112');
-      const soldTokens = tx.tokenTransfers.filter(t => t.fromUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112');
-      
-      const isBuy = boughtTokens.length > 0;
-      const isSell = soldTokens.length > 0;
-      
-      if (tx.nativeTransfers) {
-        tx.nativeTransfers.forEach(t => {
-          const amt = t.amount / 1e9;
-          
-          if (isBuy && t.fromUserAccount === addr) {
-            solSpent += amt;
-          } else if (isSell && t.toUserAccount === addr) {
-            solReceived += amt;
-          }
-        });
+      // Birdeye format: check if wallet bought or sold
+      if (tx.from && tx.to && tx.solAmount) {
+        const solAmt = parseFloat(tx.solAmount) || 0;
+        
+        // If 'to' token is not SOL, this is a BUY (spent SOL)
+        if (tx.to.symbol !== 'SOL' && tx.from.symbol === 'SOL') {
+          solSpent += solAmt;
+        }
+        // If 'from' token is not SOL, this is a SELL (received SOL)
+        else if (tx.from.symbol !== 'SOL' && tx.to.symbol === 'SOL') {
+          solReceived += solAmt;
+        }
       }
     });
     
     const realizedProfit = solReceived - solSpent;
-    console.log(`    💰 ${txs.length} txs, ${swapCount} swaps, Spent: ${solSpent.toFixed(3)} SOL, Received: ${solReceived.toFixed(3)} SOL, Profit: ${realizedProfit.toFixed(3)} SOL`);
+    console.log(`    💰 ${txs.length} txs, Spent: ${solSpent.toFixed(3)} SOL, Received: ${solReceived.toFixed(3)} SOL, Profit: ${realizedProfit.toFixed(3)} SOL`);
     
     return {
       isProfitable: realizedProfit >= 0.1,
@@ -521,6 +504,7 @@ app.get('/api/discover', async (req, res) => {
     const elite = [];
     for (const w of candidates) {
       console.log(`Checking ${w.address.slice(0, 8)}...`);
+      await new Promise(r => setTimeout(r, 1000)); // Add delay for Birdeye API
       const profit = await analyzeProfit(w.address);
       
       if (!profit.isProfitable || profit.totalProfit < minProfit) {
