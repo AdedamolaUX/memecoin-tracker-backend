@@ -289,33 +289,52 @@ async function findCluster(funding) {
 async function analyzeProfit(addr) {
   const txs = await getWalletTransactions(addr, 50);
   if (!txs || !Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
+  
   try {
-    let solIn = 0, solOut = 0;
+    let solSpent = 0;  // SOL spent buying tokens
+    let solReceived = 0;  // SOL received from selling tokens
     let swapCount = 0;
     
     txs.forEach(tx => {
-      if (tx.type === 'SWAP' && tx.nativeTransfers) {
-        swapCount++;
+      if (tx.type !== 'SWAP' || !tx.tokenTransfers || tx.tokenTransfers.length === 0) return;
+      
+      swapCount++;
+      
+      // Determine if this is a BUY or SELL based on token transfers
+      const boughtTokens = tx.tokenTransfers.filter(t => t.toUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112');
+      const soldTokens = tx.tokenTransfers.filter(t => t.fromUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112');
+      
+      const isBuy = boughtTokens.length > 0;
+      const isSell = soldTokens.length > 0;
+      
+      // Now check SOL transfers
+      if (tx.nativeTransfers) {
         tx.nativeTransfers.forEach(t => {
           const amt = t.amount / 1e9;
-          if (t.fromUserAccount === addr) solIn += amt;
-          if (t.toUserAccount === addr) solOut += amt;
+          
+          if (isBuy && t.fromUserAccount === addr) {
+            // Buying tokens: SOL is going out
+            solSpent += amt;
+          } else if (isSell && t.toUserAccount === addr) {
+            // Selling tokens: SOL is coming in
+            solReceived += amt;
+          }
         });
       }
     });
     
-    console.log(`    💰 ${txs.length} txs, ${swapCount} swaps, In: ${solIn.toFixed(3)} SOL, Out: ${solOut.toFixed(3)} SOL`);
+    const realizedProfit = solReceived - solSpent;
+    console.log(`    💰 ${txs.length} txs, ${swapCount} swaps, Spent: ${solSpent.toFixed(3)} SOL, Received: ${solReceived.toFixed(3)} SOL, Profit: ${realizedProfit.toFixed(3)} SOL`);
     
-    const realizedProfit = solOut - solIn;
-    const totalProfit = realizedProfit;
     return {
-      isProfitable: totalProfit >= 0.1,
-      totalProfit,
-      realizedProfit,
+      isProfitable: realizedProfit >= 0.1,
+      totalProfit: realizedProfit,
+      realizedProfit: realizedProfit,
       unrealizedPNL: 0,
-      profitMargin: solIn > 0 ? (totalProfit / solIn) * 100 : 0
+      profitMargin: solSpent > 0 ? (realizedProfit / solSpent) * 100 : 0
     };
   } catch (e) {
+    console.error(`    ❌ Profit analysis error:`, e.message);
     return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
   }
 }
