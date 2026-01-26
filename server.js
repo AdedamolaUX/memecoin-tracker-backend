@@ -291,32 +291,45 @@ async function analyzeProfit(addr) {
   if (!txs || !Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
   
   try {
-    let solSpent = 0;  // SOL spent buying tokens
-    let solReceived = 0;  // SOL received from selling tokens
+    let solSpent = 0;
+    let solReceived = 0;
     let swapCount = 0;
+    let debugCount = 0;
     
     txs.forEach(tx => {
       if (tx.type !== 'SWAP' || !tx.tokenTransfers || tx.tokenTransfers.length === 0) return;
       
       swapCount++;
       
-      // Determine if this is a BUY or SELL based on token transfers
+      // Debug first 2 swaps to see the structure
+      if (debugCount < 2) {
+        console.log(`    🔍 SWAP ${debugCount + 1}:`);
+        console.log(`      Token transfers:`, tx.tokenTransfers.map(t => ({ 
+          mint: t.mint?.slice(0, 8), 
+          to: t.toUserAccount?.slice(0, 8), 
+          from: t.fromUserAccount?.slice(0, 8) 
+        })));
+        console.log(`      Native transfers:`, tx.nativeTransfers?.map(t => ({ 
+          to: t.toUserAccount?.slice(0, 8), 
+          from: t.fromUserAccount?.slice(0, 8),
+          amt: (t.amount / 1e9).toFixed(3)
+        })));
+        debugCount++;
+      }
+      
       const boughtTokens = tx.tokenTransfers.filter(t => t.toUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112');
       const soldTokens = tx.tokenTransfers.filter(t => t.fromUserAccount === addr && t.mint !== 'So11111111111111111111111111111111111111112');
       
       const isBuy = boughtTokens.length > 0;
       const isSell = soldTokens.length > 0;
       
-      // Now check SOL transfers
       if (tx.nativeTransfers) {
         tx.nativeTransfers.forEach(t => {
           const amt = t.amount / 1e9;
           
           if (isBuy && t.fromUserAccount === addr) {
-            // Buying tokens: SOL is going out
             solSpent += amt;
           } else if (isSell && t.toUserAccount === addr) {
-            // Selling tokens: SOL is coming in
             solReceived += amt;
           }
         });
