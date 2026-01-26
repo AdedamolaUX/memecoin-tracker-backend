@@ -62,29 +62,27 @@ async function alertTrade(a) {
   await sendTelegram(msg);
 }
 
-async function getTokenBuyers(tokenMint, limit = 100) {
+async function getTokenBuyers(tokenMint, limit = 50) {
   try {
-    const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${tokenMint}&tx_type=swap&sort_type=desc&offset=0&limit=${limit}`, {
+    // Ensure limit is between 1-50 for Birdeye API
+    const validLimit = Math.min(Math.max(1, limit), 50);
+    
+    const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${tokenMint}&tx_type=swap&sort_type=desc&offset=0&limit=${validLimit}`, {
       headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
     });
     const data = await res.json();
     
-    // Debug: log the response structure
-    console.log(`    DEBUG: Birdeye response for ${tokenMint.slice(0, 8)}:`, JSON.stringify(data).substring(0, 200));
-    
-    if (!data.success || !data.data || !data.data.items) {
-      console.log(`    DEBUG: No data - success: ${data.success}, has data: ${!!data.data}, has items: ${!!data.data?.items}`);
+    if (!data.success) {
+      console.log(`    ⚠️ Birdeye error: ${data.message || 'Unknown'}`);
       return [];
     }
     
-    console.log(`    DEBUG: Got ${data.data.items.length} transactions`);
+    if (!data.data || !data.data.items || data.data.items.length === 0) {
+      return [];
+    }
     
     const buyers = new Map();
-    data.data.items.forEach((tx, idx) => {
-      if (idx < 2) {
-        console.log(`    DEBUG: Sample tx structure:`, JSON.stringify(tx).substring(0, 300));
-      }
-      
+    data.data.items.forEach(tx => {
       if (tx.owner && tx.from && tx.to) {
         if (tx.to.address === tokenMint) {
           const wallet = tx.owner;
@@ -420,9 +418,9 @@ app.get('/api/discover', async (req, res) => {
       
       try {
         console.log(`[${analyzed + 1}/${tokens.length}] ${token.baseToken.symbol}...`);
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 2000)); // Increased to 2s for Birdeye rate limits
         
-        const buyers = await getTokenBuyers(mint, 100);
+        const buyers = await getTokenBuyers(mint, 50);
         
         if (buyers.length === 0) {
           console.log(`  ⚠️ No buyers found`);
