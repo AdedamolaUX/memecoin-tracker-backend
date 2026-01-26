@@ -47,7 +47,7 @@ async function sendTelegram(msg) {
 
 async function alertElite(w) {
   const ws = w.address.slice(0, 6) + '...' + w.address.slice(-4);
-  let msg = `💎 <b>ELITE WALLET #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n💰 ${w.totalProfit} SOL\n📊 Realized: ${w.realizedProfit} SOL\n📈 ${w.profitMargin}%\n🎯 ${w.earlyBuys} early\n📊 ${w.totalTokensTraded} tokens\n`;
+  let msg = `💎 <b>SMART MONEY WALLET #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n⭐ Score: ${w.smartMoneyScore}\n🎯 ${w.earlyBuys} early entries\n📊 ${w.totalTokensTraded} tokens\n📈 Volume Score: ${w.volumeScore}\n`;
   if (w.fundingWallet) msg += `\n👥 Cluster: <code>${w.fundingWallet.slice(0, 6)}...${w.fundingWallet.slice(-4)}</code> (${w.clusterSize})\n`;
   msg += `\n🔗 <a href="https://solscan.io/account/${w.address}">Solscan</a>`;
   await sendTelegram(msg);
@@ -64,7 +64,6 @@ async function alertTrade(a) {
 
 async function getTokenBuyers(tokenMint, limit = 50) {
   try {
-    // Ensure limit is between 1-50 for Birdeye API
     const validLimit = Math.min(Math.max(1, limit), 50);
     
     const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${tokenMint}&tx_type=swap&sort_type=desc&offset=0&limit=${validLimit}`, {
@@ -286,55 +285,6 @@ async function findCluster(funding) {
   }
 }
 
-async function analyzeProfit(addr) {
-  try {
-    // Use Birdeye to get wallet transaction history - more reliable than QuickNode
-    const res = await fetch(`https://public-api.birdeye.so/v1/wallet/tx_list?wallet=${addr}&limit=50&tx_type=swap`, {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
-    });
-    const data = await res.json();
-    
-    if (!data.success || !data.data || !data.data.items) {
-      console.log(`    ⚠️ No Birdeye tx data for wallet`);
-      return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
-    }
-    
-    let solSpent = 0;
-    let solReceived = 0;
-    const txs = data.data.items;
-    
-    txs.forEach(tx => {
-      // Birdeye format: check if wallet bought or sold
-      if (tx.from && tx.to && tx.solAmount) {
-        const solAmt = parseFloat(tx.solAmount) || 0;
-        
-        // If 'to' token is not SOL, this is a BUY (spent SOL)
-        if (tx.to.symbol !== 'SOL' && tx.from.symbol === 'SOL') {
-          solSpent += solAmt;
-        }
-        // If 'from' token is not SOL, this is a SELL (received SOL)
-        else if (tx.from.symbol !== 'SOL' && tx.to.symbol === 'SOL') {
-          solReceived += solAmt;
-        }
-      }
-    });
-    
-    const realizedProfit = solReceived - solSpent;
-    console.log(`    💰 ${txs.length} txs, Spent: ${solSpent.toFixed(3)} SOL, Received: ${solReceived.toFixed(3)} SOL, Profit: ${realizedProfit.toFixed(3)} SOL`);
-    
-    return {
-      isProfitable: realizedProfit >= 0.1,
-      totalProfit: realizedProfit,
-      realizedProfit: realizedProfit,
-      unrealizedPNL: 0,
-      profitMargin: solSpent > 0 ? (realizedProfit / solSpent) * 100 : 0
-    };
-  } catch (e) {
-    console.error(`    ❌ Profit analysis error:`, e.message);
-    return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
-  }
-}
-
 async function monitorWallet(addr) {
   const txs = await getWalletTransactions(addr, 5);
   if (!txs || !Array.isArray(txs) || txs.length === 0) return null;
@@ -405,25 +355,35 @@ app.get('/api/discover', async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 20, 30);
     const top = Math.min(parseInt(req.query.top) || 5, 10);
-    const minProfit = parseFloat(req.query.minProfit) || 0.1;
     const alert = req.query.alert === 'true';
 
-    console.log('=== DISCOVERY START ===');
+    console.log('=== SMART MONEY DISCOVERY START ===');
 
     let tokens = [];
     try {
-      const birdeyeRes = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hChangePercent&sort_type=desc&offset=0&limit=${limit}`, {
+      const birdeyeRes = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, {
         headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
       });
       const birdeyeData = await birdeyeRes.json();
       if (birdeyeData.data && birdeyeData.data.tokens) {
-        tokens = birdeyeData.data.tokens.map(t => ({
-          baseToken: { address: t.address, symbol: t.symbol },
-          priceChange: { h24: t.v24hChangePercent || 0 }
-        })).slice(0, limit);
-        console.log(`✅ Birdeye: ${tokens.length} tokens`);
+        tokens = birdeyeData.data.tokens
+          .filter(t => {
+            const volume24h = t.v24hUSD || 0;
+            const marketCap = t.mc || 0;
+            return volume24h >= 10000 && marketCap > 0 && marketCap < 10000000;
+          })
+          .map(t => ({
+            baseToken: { address: t.address, symbol: t.symbol },
+            priceChange: { h24: t.v24hChangePercent || 0 },
+            volume24h: t.v24hUSD || 0,
+            marketCap: t.mc || 0
+          }))
+          .slice(0, limit);
+        console.log(`✅ Birdeye: ${tokens.length} tokens (sorted by volume, filtered for <$10M cap)`);
       }
-    } catch (e) {}
+    } catch (e) {
+      console.log(`❌ Birdeye error:`, e.message);
+    }
 
     if (tokens.length === 0) {
       return res.json({ success: false, error: 'No tokens found' });
@@ -435,11 +395,16 @@ app.get('/api/discover', async (req, res) => {
 
     for (const token of tokens) {
       const mint = token.baseToken.address;
-      tokenData[mint] = { symbol: token.baseToken.symbol, change24h: token.priceChange?.h24 || 0 };
+      tokenData[mint] = { 
+        symbol: token.baseToken.symbol, 
+        change24h: token.priceChange?.h24 || 0,
+        volume24h: token.volume24h || 0,
+        marketCap: token.marketCap || 0
+      };
       
       try {
         console.log(`[${analyzed + 1}/${tokens.length}] ${token.baseToken.symbol}...`);
-        await new Promise(r => setTimeout(r, 2000)); // Increased to 2s for Birdeye rate limits
+        await new Promise(r => setTimeout(r, 2000));
         
         const buyers = await getTokenBuyers(mint, 50);
         
@@ -464,7 +429,8 @@ app.get('/api/discover', async (req, res) => {
               totalTokens: 0, 
               earlyBuyCount: 0, 
               lastActivity: 0, 
-              tokensFound: [] 
+              tokensFound: [],
+              volumeScore: 0
             };
           }
           
@@ -473,15 +439,32 @@ app.get('/api/discover', async (req, res) => {
           w.lastActivity = Math.max(w.lastActivity, timestamp);
           
           const percentile = ((i + 1) / sorted.length) * 100;
-          if (percentile <= 5) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
-          else if (percentile <= 10) { w.earlyEntryScore += 7; w.earlyBuyCount++; }
+          if (percentile <= 5) { 
+            w.earlyEntryScore += 15;
+            w.earlyBuyCount++; 
+          } else if (percentile <= 10) { 
+            w.earlyEntryScore += 10;
+            w.earlyBuyCount++; 
+          } else if (percentile <= 20) {
+            w.earlyEntryScore += 5;
+          }
+          
+          const volume = tokenData[mint].volume24h;
+          if (volume > 1000000) w.volumeScore += 10;
+          else if (volume > 500000) w.volumeScore += 7;
+          else if (volume > 100000) w.volumeScore += 5;
           
           const perf = tokenData[mint].change24h;
           if (perf > 100) w.successScore += 15;
           else if (perf > 50) w.successScore += 10;
           else if (perf > 20) w.successScore += 5;
           
-          w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf });
+          w.tokensFound.push({ 
+            symbol: tokenData[mint].symbol, 
+            performance: perf,
+            volume: volume,
+            marketCap: tokenData[mint].marketCap
+          });
         });
         
         const topWallet = Object.values(scores).sort((a, b) => b.totalTokens - a.totalTokens)[0];
@@ -496,23 +479,18 @@ app.get('/api/discover', async (req, res) => {
     
     const candidates = Object.values(scores)
       .filter(w => !isBot(w) && w.totalTokens >= 2)
-      .sort((a, b) => (b.earlyEntryScore + b.successScore) - (a.earlyEntryScore + a.successScore))
+      .sort((a, b) => {
+        const scoreA = a.earlyEntryScore + a.volumeScore + (a.successScore * 0.5);
+        const scoreB = b.earlyEntryScore + b.volumeScore + (b.successScore * 0.5);
+        return scoreB - scoreA;
+      })
       .slice(0, top * 2);
     
-    console.log(`Candidates (2+ tokens): ${candidates.length}`);
+    console.log(`Smart money candidates (2+ tokens): ${candidates.length}`);
     
     const elite = [];
     for (const w of candidates) {
-      console.log(`Checking ${w.address.slice(0, 8)}...`);
-      await new Promise(r => setTimeout(r, 1000)); // Add delay for Birdeye API
-      const profit = await analyzeProfit(w.address);
-      
-      if (!profit.isProfitable || profit.totalProfit < minProfit) {
-        console.log(`  ❌ ${profit.totalProfit.toFixed(3)} SOL`);
-        continue;
-      }
-      
-      console.log(`  ✅ ${profit.totalProfit.toFixed(2)} SOL`);
+      console.log(`Analyzing ${w.address.slice(0, 8)}... (${w.earlyBuyCount} early buys, ${w.totalTokens} tokens)`);
       
       const funding = await findFunding(w.address);
       let cluster = [];
@@ -521,32 +499,29 @@ app.get('/api/discover', async (req, res) => {
         walletClusters.set(funding.fundingWallet, cluster);
       }
       
-      w.totalProfit = profit.totalProfit;
-      w.realizedProfit = profit.realizedProfit;
-      w.unrealizedPNL = profit.unrealizedPNL;
-      w.profitMargin = profit.profitMargin;
       w.fundingWallet = funding?.fundingWallet || null;
       w.clusterSize = cluster.length;
+      w.totalScore = w.earlyEntryScore + w.volumeScore + (w.successScore * 0.5);
       
       elite.push(w);
-      await new Promise(r => setTimeout(r, 2000));
+      
+      await new Promise(r => setTimeout(r, 1000));
       if (elite.length >= top) break;
     }
 
     const discovered = elite.map((w, i) => {
-      const tier = getTier(95);
+      const scorePercent = Math.min(95, 60 + (w.totalScore / 2));
+      const tier = getTier(scorePercent);
       return {
         rank: i + 1,
         address: w.address,
         tier: tier.tier,
         badge: tier.emoji,
         tierColor: tier.color,
-        totalProfit: w.totalProfit.toFixed(2),
-        realizedProfit: w.realizedProfit.toFixed(2),
-        unrealizedPNL: w.unrealizedPNL.toFixed(2),
-        profitMargin: w.profitMargin.toFixed(1),
+        smartMoneyScore: w.totalScore.toFixed(1),
         earlyBuys: w.earlyBuyCount,
         totalTokensTraded: w.totalTokens,
+        volumeScore: w.volumeScore,
         fundingWallet: w.fundingWallet,
         clusterSize: w.clusterSize,
         tokensFound: w.tokensFound.slice(0, 3)
@@ -563,7 +538,7 @@ app.get('/api/discover', async (req, res) => {
     res.json({
       success: true,
       discoveredWallets: discovered,
-      stats: { tokensAnalyzed: analyzed, walletsScanned: Object.keys(scores).length, eliteWalletsFound: elite.length },
+      stats: { tokensAnalyzed: analyzed, walletsScanned: Object.keys(scores).length, smartMoneyFound: elite.length },
       telegramEnabled: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)
     });
   } catch (error) {
@@ -615,7 +590,7 @@ app.post('/api/telegram/test', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v3.7 - FIXED Buyer Discovery',
+    status: 'Elite Tracker v4.0 - Smart Money Discovery',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     endpoints: {
       discover: '/api/discover?limit=20&top=5&alert=true',
@@ -628,6 +603,6 @@ app.get('/', (req, res) => {
 
 loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v3.7 - FIXED Buyer Discovery');
+  console.log('🚀 Elite Tracker v4.0 - Smart Money Discovery');
   console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
 });
