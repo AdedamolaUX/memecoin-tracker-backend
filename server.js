@@ -69,10 +69,22 @@ async function getTokenBuyers(tokenMint, limit = 100) {
     });
     const data = await res.json();
     
-    if (!data.success || !data.data || !data.data.items) return [];
+    // Debug: log the response structure
+    console.log(`    DEBUG: Birdeye response for ${tokenMint.slice(0, 8)}:`, JSON.stringify(data).substring(0, 200));
+    
+    if (!data.success || !data.data || !data.data.items) {
+      console.log(`    DEBUG: No data - success: ${data.success}, has data: ${!!data.data}, has items: ${!!data.data?.items}`);
+      return [];
+    }
+    
+    console.log(`    DEBUG: Got ${data.data.items.length} transactions`);
     
     const buyers = new Map();
-    data.data.items.forEach(tx => {
+    data.data.items.forEach((tx, idx) => {
+      if (idx < 2) {
+        console.log(`    DEBUG: Sample tx structure:`, JSON.stringify(tx).substring(0, 300));
+      }
+      
       if (tx.owner && tx.from && tx.to) {
         if (tx.to.address === tokenMint) {
           const wallet = tx.owner;
