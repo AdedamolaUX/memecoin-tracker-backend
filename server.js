@@ -291,8 +291,11 @@ async function analyzeProfit(addr) {
   if (!txs || !Array.isArray(txs)) return { isProfitable: false, totalProfit: 0, realizedProfit: 0, unrealizedPNL: 0 };
   try {
     let solIn = 0, solOut = 0;
+    let swapCount = 0;
+    
     txs.forEach(tx => {
       if (tx.type === 'SWAP' && tx.nativeTransfers) {
+        swapCount++;
         tx.nativeTransfers.forEach(t => {
           const amt = t.amount / 1e9;
           if (t.fromUserAccount === addr) solIn += amt;
@@ -300,6 +303,9 @@ async function analyzeProfit(addr) {
         });
       }
     });
+    
+    console.log(`    💰 ${txs.length} txs, ${swapCount} swaps, In: ${solIn.toFixed(3)} SOL, Out: ${solOut.toFixed(3)} SOL`);
+    
     const realizedProfit = solOut - solIn;
     const totalProfit = realizedProfit;
     return {
