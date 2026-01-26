@@ -30,6 +30,11 @@ const BLACKLISTED = new Set([
   'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtL', '5VCwKtCXgCJ6kit5FybXjvriW3xELsFDhYrPSqtJNmcD',
   'GUfCR9mK6azb9vcpsxgXyj7XRPAKJd4KMHTTVvtncGgp', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
   'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM',
+  // AMM Router wallets (buy/sell in seconds)
+  '5m4VGV3u16U9QkKd74Ffc6ziv1Zqs44cVmA3oajAxkM6',
+  'ExCZTxX1gV27Aeg7jb4hQBqkwDKHZnETEeWb9otCNBc',
+  'EZQiSmPiXnfQrJzCEqYS5f8NBhoTPro4jQznEGRkcP9R',
+  '2fPCxpdcAqm51CpM5CaSqCzY8XWfSg9Y9RAsSwXWR7tY',
 ]);
 
 async function sendTelegram(msg) {
@@ -81,20 +86,54 @@ async function getTokenBuyers(tokenMint, limit = 50) {
     }
     
     const buyers = new Map();
+    const walletActivity = new Map(); // Track buy/sell activity per wallet
+    
     data.data.items.forEach(tx => {
       if (tx.owner && tx.from && tx.to) {
+        const wallet = tx.owner;
+        const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
+        
+        // Track if wallet bought or sold
+        if (!walletActivity.has(wallet)) {
+          walletActivity.set(wallet, { buys: 0, sells: 0, timestamps: [] });
+        }
+        const activity = walletActivity.get(wallet);
+        activity.timestamps.push(timestamp);
+        
         if (tx.to.address === tokenMint) {
-          const wallet = tx.owner;
-          const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
-          
+          activity.buys++;
           if (!buyers.has(wallet)) {
             buyers.set(wallet, timestamp);
           }
+        } else if (tx.from.address === tokenMint) {
+          activity.sells++;
         }
       }
     });
     
-    return Array.from(buyers.entries()).map(([wallet, timestamp]) => ({ wallet, timestamp }));
+    // Filter out AMM bots: wallets that buy AND sell within same timeframe (likely bots/MEV)
+    const realBuyers = Array.from(buyers.entries()).filter(([wallet, timestamp]) => {
+      const activity = walletActivity.get(wallet);
+      if (!activity) return false;
+      
+      // If wallet both bought AND sold in the same tx batch, it's likely a bot/AMM
+      if (activity.buys > 0 && activity.sells > 0) {
+        const timeSpan = Math.max(...activity.timestamps) - Math.min(...activity.timestamps);
+        // If buy/sell happened within 60 seconds, it's a bot
+        if (timeSpan < 60) {
+          return false;
+        }
+      }
+      
+      // If wallet has way more sells than buys, it's likely a market maker
+      if (activity.sells > activity.buys * 2) {
+        return false;
+      }
+      
+      return true;
+    });
+    
+    return realBuyers.map(([wallet, timestamp]) => ({ wallet, timestamp }));
   } catch (e) {
     console.error(`  ❌ Birdeye txs error:`, e.message);
     return [];
