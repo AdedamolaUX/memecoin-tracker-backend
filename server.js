@@ -13,6 +13,7 @@ const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 const QUICKNODE_URL = process.env.QUICKNODE_URL || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const TARGET_TOKENS = process.env.TARGET_TOKENS || ''; // Comma-separated token addresses
 
 const useQuickNode = !!QUICKNODE_URL;
 console.log('🔌 Using:', useQuickNode ? 'QuickNode' : 'Helius');
@@ -399,29 +400,61 @@ app.get('/api/discover', async (req, res) => {
     console.log('=== SMART MONEY DISCOVERY START ===');
 
     let tokens = [];
-    try {
-      const birdeyeRes = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, {
-        headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
-      });
-      const birdeyeData = await birdeyeRes.json();
-      if (birdeyeData.data && birdeyeData.data.tokens) {
-        tokens = birdeyeData.data.tokens
-          .filter(t => {
-            const volume24h = t.v24hUSD || 0;
-            const marketCap = t.mc || 0;
-            return volume24h >= 10000 && marketCap > 0 && marketCap < 10000000;
-          })
-          .map(t => ({
-            baseToken: { address: t.address, symbol: t.symbol },
-            priceChange: { h24: t.v24hChangePercent || 0 },
-            volume24h: t.v24hUSD || 0,
-            marketCap: t.mc || 0
-          }))
-          .slice(0, limit);
-        console.log(`✅ Birdeye: ${tokens.length} tokens (sorted by volume, filtered for <$10M cap)`);
+    
+    // Check if manual token list is provided
+    if (TARGET_TOKENS && TARGET_TOKENS.trim()) {
+      console.log('📋 Using manual token list from TARGET_TOKENS');
+      const addresses = TARGET_TOKENS.split(',').map(addr => addr.trim()).filter(addr => addr.length > 0);
+      
+      // Fetch token data from Birdeye for each address
+      for (const address of addresses.slice(0, limit)) {
+        try {
+          const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${address}`, {
+            headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+          });
+          const data = await res.json();
+          
+          if (data.success && data.data) {
+            tokens.push({
+              baseToken: { address: address, symbol: data.data.symbol || 'UNKNOWN' },
+              priceChange: { h24: data.data.v24hChangePercent || 0 },
+              volume24h: data.data.v24hUSD || 0,
+              marketCap: data.data.mc || 0
+            });
+          }
+          await new Promise(r => setTimeout(r, 500)); // Rate limit
+        } catch (e) {
+          console.log(`  ⚠️ Failed to fetch data for ${address.slice(0, 8)}`);
+        }
       }
-    } catch (e) {
-      console.log(`❌ Birdeye error:`, e.message);
+      console.log(`✅ Loaded ${tokens.length} tokens from manual list`);
+    } else {
+      // Fallback to Birdeye auto-discovery
+      console.log('🔍 Auto-discovering tokens from Birdeye (no TARGET_TOKENS set)');
+      try {
+        const birdeyeRes = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, {
+          headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
+        });
+        const birdeyeData = await birdeyeRes.json();
+        if (birdeyeData.data && birdeyeData.data.tokens) {
+          tokens = birdeyeData.data.tokens
+            .filter(t => {
+              const volume24h = t.v24hUSD || 0;
+              const marketCap = t.mc || 0;
+              return volume24h >= 10000 && marketCap > 0 && marketCap < 10000000;
+            })
+            .map(t => ({
+              baseToken: { address: t.address, symbol: t.symbol },
+              priceChange: { h24: t.v24hChangePercent || 0 },
+              volume24h: t.v24hUSD || 0,
+              marketCap: t.mc || 0
+            }))
+            .slice(0, limit);
+          console.log(`✅ Birdeye: ${tokens.length} tokens (sorted by volume, filtered for <$10M cap)`);
+        }
+      } catch (e) {
+        console.log(`❌ Birdeye error:`, e.message);
+      }
     }
 
     if (tokens.length === 0) {
