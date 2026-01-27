@@ -59,9 +59,9 @@ async function alertTrade(a) {
 
 async function getTokenBuyers(mint, limit = 50) {
   try {
-    // Use Token Holders API to get top holders (likely early buyers still holding)
-    const res = await fetch(`https://public-api.birdeye.so/v1/token/holder?address=${mint}&offset=0&limit=${Math.min(limit, 100)}`, {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+    // Use Token Holders API - correct endpoint
+    const res = await fetch(`https://public-api.birdeye.so/defi/token_holder?address=${mint}&offset=0&limit=${Math.min(limit, 100)}`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
     });
     const data = await res.json();
     
