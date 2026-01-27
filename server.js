@@ -57,43 +57,67 @@ async function alertTrade(a) {
   await sendTelegram(msg);
 }
 
-async function getTokenBuyers(mint, limit = 50) {
+async function getTokenBuyers(mint, limit = 150) {
   try {
-    // Use Token Holders API - correct endpoint
-    const res = await fetch(`https://public-api.birdeye.so/defi/token_holder?address=${mint}&offset=0&limit=${Math.min(limit, 100)}`, {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
-    });
-    const data = await res.json();
+    const buyers = new Map();
+    const activity = new Map();
     
-    if (!data.success || !data.data?.items) {
-      console.log(`    ⚠️ Birdeye holders error: ${data.message || 'No data'}`);
-      return [];
+    // Make multiple requests to get more transactions (50 per request, max 3 requests = 150 txs)
+    const numRequests = Math.min(Math.ceil(limit / 50), 3);
+    
+    for (let i = 0; i < numRequests; i++) {
+      const offset = i * 50;
+      const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${mint}&tx_type=swap&sort_type=desc&offset=${offset}&limit=50`, {
+        headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
+      });
+      const data = await res.json();
+      
+      if (!data.success || !data.data?.items) {
+        if (i === 0) console.log(`    ⚠️ Birdeye error: ${data.message || 'No data'}`);
+        break;
+      }
+      
+      data.data.items.forEach(tx => {
+        if (!tx.owner || !tx.from || !tx.to) return;
+        const wallet = tx.owner;
+        const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
+        
+        if (!activity.has(wallet)) activity.set(wallet, { buys: 0, sells: 0, timestamps: [] });
+        const act = activity.get(wallet);
+        act.timestamps.push(timestamp);
+        
+        if (tx.to.address === mint) {
+          act.buys++;
+          if (!buyers.has(wallet)) buyers.set(wallet, timestamp);
+        } else if (tx.from.address === mint) act.sells++;
+      });
+      
+      // Small delay between requests to avoid rate limits
+      if (i < numRequests - 1) await new Promise(r => setTimeout(r, 300));
     }
     
-    const currentTime = Math.floor(Date.now() / 1000);
+    // Filter out bots and AMMs
+    const realBuyers = Array.from(buyers.entries()).filter(([wallet]) => {
+      const act = activity.get(wallet);
+      if (!act) return false;
+      
+      // Filter out instant buy/sell (AMM bots)
+      if (act.buys > 0 && act.sells > 0) {
+        const span = Math.max(...act.timestamps) - Math.min(...act.timestamps);
+        if (span < 60) return false;
+      }
+      
+      // Filter out market makers (way more sells than buys)
+      if (act.sells > act.buys * 2) return false;
+      
+      return true;
+    }).map(([wallet, timestamp]) => ({ wallet, timestamp }));
     
-    // Filter out obvious contracts/programs and return holders as "buyers"
-    const realHolders = data.data.items
-      .filter(holder => {
-        const addr = holder.address;
-        // Filter out blacklisted, programs, and holders with tiny amounts
-        if (BLACKLISTED.has(addr) || isProgram(addr)) return false;
-        // Filter out holders with less than 0.1% of supply (likely bots/dust)
-        const percentage = parseFloat(holder.uiAmountString) / parseFloat(holder.decimals || 1);
-        return percentage > 0;
-      })
-      .map(holder => ({
-        wallet: holder.address,
-        timestamp: currentTime - (3600 * 24), // Assume they bought ~24h ago
-        amount: parseFloat(holder.uiAmountString) || 0
-      }))
-      .sort((a, b) => b.amount - a.amount); // Sort by amount held (biggest holders first)
-    
-    console.log(`    📊 Found ${realHolders.length} holders (filtered from ${data.data.items.length})`);
-    return realHolders;
+    console.log(`    📊 Found ${realBuyers.length} buyers from ${buyers.size} total wallets`);
+    return realBuyers;
     
   } catch (e) {
-    console.error(`  ❌ Birdeye holders error:`, e.message);
+    console.error(`  ❌ Birdeye error:`, e.message);
     return [];
   }
 }
@@ -332,17 +356,16 @@ app.get('/api/discover', async (req, res) => {
         console.log(`[${analyzed + 1}/${tokens.length}] ${token.baseToken.symbol}...`);
         await new Promise(r => setTimeout(r, 2000));
         
-        const buyers = await getTokenBuyers(mint, 100); // Increased to 100 holders
+        const buyers = await getTokenBuyers(mint, 150); // Get 150 transactions (3 requests x 50)
         if (!buyers.length) {
-          console.log(`  ⚠️ No holders`);
+          console.log(`  ⚠️ No buyers`);
           continue;
         }
         
-        console.log(`  👥 ${buyers.length} holders`);
+        console.log(`  👥 ${buyers.length} buyers`);
         analyzed++;
         
-        // Sort by amount held (already sorted in getTokenBuyers, but keep timestamp sort for scoring)
-        const sorted = buyers.sort((a, b) => b.amount - a.amount); // Biggest holders = earliest/best buyers
+        const sorted = buyers.sort((a, b) => a.timestamp - b.timestamp); // Earliest buyers first
         sorted.forEach(({ wallet, timestamp }, i) => {
           if (BLACKLISTED.has(wallet) || isProgram(wallet)) return;
           
