@@ -3,20 +3,15 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
 app.use(cors());
 app.use(express.json());
 
+const PORT = process.env.PORT || 3001;
 const BIRDEYE_API_KEY = '73e8a243fd26414098b027317db6cbfd';
-const HELIUS_API_KEY = 'a6f9ba84-1abf-4c90-8e04-fc0a61294407';
 const QUICKNODE_URL = process.env.QUICKNODE_URL || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const TARGET_TOKENS = process.env.TARGET_TOKENS || ''; // Comma-separated token addresses
-
-const useQuickNode = !!QUICKNODE_URL;
-console.log('🔌 Using:', useQuickNode ? 'QuickNode' : 'Helius');
+const TARGET_TOKENS = process.env.TARGET_TOKENS || '';
 
 let tokenCache = {};
 const trackedWallets = new Map();
@@ -31,303 +26,182 @@ const BLACKLISTED = new Set([
   'AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtL', '5VCwKtCXgCJ6kit5FybXjvriW3xELsFDhYrPSqtJNmcD',
   'GUfCR9mK6azb9vcpsxgXyj7XRPAKJd4KMHTTVvtncGgp', '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
   'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM',
-  // AMM Router wallets (buy/sell in seconds)
-  '5m4VGV3u16U9QkKd74Ffc6ziv1Zqs44cVmA3oajAxkM6',
-  'ExCZTxX1gV27Aeg7jb4hQBqkwDKHZnETEeWb9otCNBc',
-  'EZQiSmPiXnfQrJzCEqYS5f8NBhoTPro4jQznEGRkcP9R',
-  '2fPCxpdcAqm51CpM5CaSqCzY8XWfSg9Y9RAsSwXWR7tY',
+  '5m4VGV3u16U9QkKd74Ffc6ziv1Zqs44cVmA3oajAxkM6', 'ExCZTxX1gV27Aeg7jb4hQBqkwDKHZnETEeWb9otCNBc',
+  'EZQiSmPiXnfQrJzCEqYS5f8NBhoTPro4jQznEGRkcP9R', '2fPCxpdcAqm51CpM5CaSqCzY8XWfSg9Y9RAsSwXWR7tY',
 ]);
 
 async function sendTelegram(msg) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
   try {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: 'HTML', disable_web_page_preview: true })
     });
-    const data = await res.json();
-    return data.ok;
+    return (await res.json()).ok;
   } catch { return false; }
 }
 
 async function alertElite(w) {
   const ws = w.address.slice(0, 6) + '...' + w.address.slice(-4);
-  let msg = `💎 <b>SMART MONEY WALLET #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n⭐ Score: ${w.smartMoneyScore}\n🎯 ${w.earlyBuys} early entries\n📊 ${w.totalTokensTraded} tokens\n📈 Volume Score: ${w.volumeScore}\n`;
-  if (w.fundingWallet) msg += `\n👥 Cluster: <code>${w.fundingWallet.slice(0, 6)}...${w.fundingWallet.slice(-4)}</code> (${w.clusterSize})\n`;
+  let msg = `💎 <b>SMART MONEY #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n⭐ Score: ${w.smartMoneyScore}\n🎯 ${w.earlyBuys} early\n📊 ${w.totalTokensTraded} tokens\n`;
+  if (w.fundingWallet) msg += `👥 Cluster: ${w.clusterSize}\n`;
   msg += `\n🔗 <a href="https://solscan.io/account/${w.address}">Solscan</a>`;
   await sendTelegram(msg);
 }
 
 async function alertTrade(a) {
   const ws = a.walletAddress.slice(0, 6) + '...' + a.walletAddress.slice(-4);
-  let msg = `🚨 <b>NEW TRADE</b>\n\n👤 <code>${ws}</code>\n⏰ ${new Date(a.timestamp * 1000).toLocaleString()}\n\n🪙 Bought:\n`;
-  (a.tokensBought || []).forEach(t => msg += `  • ${t.mint.slice(0, 6)}...${t.mint.slice(-4)}\n`);
+  let msg = `🚨 <b>NEW TRADE</b>\n👤 <code>${ws}</code>\n⏰ ${new Date(a.timestamp * 1000).toLocaleString()}\n\n🪙 Bought:\n`;
+  (a.tokensBought || []).forEach(t => msg += `  • ${t.mint.slice(0, 6)}...\n`);
   msg += `\n🔗 <a href="https://solscan.io/account/${a.walletAddress}">Solscan</a>`;
-  if (a.tokensBought && a.tokensBought[0]) msg += `\n📊 <a href="https://dexscreener.com/solana/${a.tokensBought[0].mint}">DexScreener</a>`;
   await sendTelegram(msg);
 }
 
-async function getTokenBuyers(tokenMint, limit = 50) {
+async function getTokenBuyers(mint, limit = 50) {
   try {
-    const validLimit = Math.min(Math.max(1, limit), 50);
-    
-    const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${tokenMint}&tx_type=swap&sort_type=desc&offset=0&limit=${validLimit}`, {
+    const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${mint}&tx_type=swap&sort_type=desc&offset=0&limit=${Math.min(limit, 50)}`, {
       headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
     });
     const data = await res.json();
-    
-    if (!data.success) {
-      console.log(`    ⚠️ Birdeye error: ${data.message || 'Unknown'}`);
-      return [];
-    }
-    
-    if (!data.data || !data.data.items || data.data.items.length === 0) {
-      return [];
-    }
+    if (!data.success || !data.data?.items) return [];
     
     const buyers = new Map();
-    const walletActivity = new Map(); // Track buy/sell activity per wallet
+    const activity = new Map();
     
     data.data.items.forEach(tx => {
-      if (tx.owner && tx.from && tx.to) {
-        const wallet = tx.owner;
-        const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
-        
-        // Track if wallet bought or sold
-        if (!walletActivity.has(wallet)) {
-          walletActivity.set(wallet, { buys: 0, sells: 0, timestamps: [] });
-        }
-        const activity = walletActivity.get(wallet);
-        activity.timestamps.push(timestamp);
-        
-        if (tx.to.address === tokenMint) {
-          activity.buys++;
-          if (!buyers.has(wallet)) {
-            buyers.set(wallet, timestamp);
-          }
-        } else if (tx.from.address === tokenMint) {
-          activity.sells++;
-        }
-      }
+      if (!tx.owner || !tx.from || !tx.to) return;
+      const wallet = tx.owner;
+      const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
+      
+      if (!activity.has(wallet)) activity.set(wallet, { buys: 0, sells: 0, timestamps: [] });
+      const act = activity.get(wallet);
+      act.timestamps.push(timestamp);
+      
+      if (tx.to.address === mint) {
+        act.buys++;
+        if (!buyers.has(wallet)) buyers.set(wallet, timestamp);
+      } else if (tx.from.address === mint) act.sells++;
     });
     
-    // Filter out AMM bots: wallets that buy AND sell within same timeframe (likely bots/MEV)
-    const realBuyers = Array.from(buyers.entries()).filter(([wallet, timestamp]) => {
-      const activity = walletActivity.get(wallet);
-      if (!activity) return false;
-      
-      // If wallet both bought AND sold in the same tx batch, it's likely a bot/AMM
-      if (activity.buys > 0 && activity.sells > 0) {
-        const timeSpan = Math.max(...activity.timestamps) - Math.min(...activity.timestamps);
-        // If buy/sell happened within 60 seconds, it's a bot
-        if (timeSpan < 60) {
-          return false;
-        }
+    return Array.from(buyers.entries()).filter(([wallet]) => {
+      const act = activity.get(wallet);
+      if (!act) return false;
+      if (act.buys > 0 && act.sells > 0) {
+        const span = Math.max(...act.timestamps) - Math.min(...act.timestamps);
+        if (span < 60) return false;
       }
-      
-      // If wallet has way more sells than buys, it's likely a market maker
-      if (activity.sells > activity.buys * 2) {
-        return false;
-      }
-      
-      return true;
-    });
-    
-    return realBuyers.map(([wallet, timestamp]) => ({ wallet, timestamp }));
+      return act.sells <= act.buys * 2;
+    }).map(([wallet, timestamp]) => ({ wallet, timestamp }));
   } catch (e) {
-    console.error(`  ❌ Birdeye txs error:`, e.message);
+    console.error(`❌ Birdeye error:`, e.message);
     return [];
   }
 }
 
-async function getTokenPriceInSOL(tokenMint) {
-  try {
-    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${tokenMint}`);
-    const data = await res.json();
-    if (data && data.pairs && data.pairs[0]) {
-      const priceUSD = parseFloat(data.pairs[0].priceUsd) || 0;
-      const solRes = await fetch('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112');
-      const solData = await solRes.json();
-      const solPriceUSD = parseFloat(solData.pairs?.[0]?.priceUsd) || 100;
-      return priceUSD / solPriceUSD;
-    }
-    return 0;
-  } catch { return 0; }
-}
-
 async function getWalletTransactions(address, limit = 100) {
-  if (useQuickNode) {
-    try {
-      const response = await fetch(QUICKNODE_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getSignaturesForAddress',
-          params: [address, { limit }]
-        })
-      });
-      const data = await response.json();
-      if (data.error) return null;
-      const signatures = data.result || [];
-      if (signatures.length === 0) return [];
+  if (!QUICKNODE_URL) return null;
+  try {
+    const sigRes = await fetch(QUICKNODE_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [address, { limit }] })
+    });
+    const sigData = await sigRes.json();
+    if (sigData.error || !sigData.result?.length) return [];
+    
+    const txPromises = sigData.result.slice(0, 50).map(sig => 
+      fetch(QUICKNODE_URL, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTransaction', params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }] })
+      }).then(r => r.json())
+    );
+    
+    const txResults = await Promise.all(txPromises);
+    return txResults.map(r => {
+      if (!r.result) return null;
+      const tx = r.result;
+      const tokenTransfers = [];
+      const nativeTransfers = [];
       
-      const txPromises = signatures.slice(0, Math.min(limit, 50)).map(sig => 
-        fetch(QUICKNODE_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'getTransaction',
-            params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
-          })
-        }).then(r => r.json())
-      );
+      if (tx.meta?.postTokenBalances && tx.meta?.preTokenBalances) {
+        tx.meta.postTokenBalances.forEach(post => {
+          const pre = tx.meta.preTokenBalances.find(p => p.accountIndex === post.accountIndex);
+          const preAmt = pre ? parseFloat(pre.uiTokenAmount.uiAmountString || '0') : 0;
+          const postAmt = parseFloat(post.uiTokenAmount.uiAmountString || '0');
+          if (postAmt !== preAmt) {
+            const accounts = tx.transaction.message.accountKeys;
+            const toAcc = accounts[post.accountIndex];
+            const fromAcc = accounts[pre?.accountIndex || 0];
+            tokenTransfers.push({
+              mint: post.mint,
+              toUserAccount: typeof toAcc === 'string' ? toAcc : (toAcc?.pubkey || ''),
+              fromUserAccount: typeof fromAcc === 'string' ? fromAcc : (fromAcc?.pubkey || ''),
+              tokenAmount: Math.abs(postAmt - preAmt)
+            });
+          }
+        });
+      }
       
-      const txResults = await Promise.all(txPromises);
-      return txResults.map(r => {
-        if (!r.result) return null;
-        const tx = r.result;
-        const tokenTransfers = [];
-        const nativeTransfers = [];
-        
-        if (tx.meta && tx.meta.postTokenBalances && tx.meta.preTokenBalances) {
-          tx.meta.postTokenBalances.forEach(post => {
-            const pre = tx.meta.preTokenBalances.find(p => p.accountIndex === post.accountIndex);
-            const preAmount = pre ? parseFloat(pre.uiTokenAmount.uiAmountString || '0') : 0;
-            const postAmount = parseFloat(post.uiTokenAmount.uiAmountString || '0');
-            if (postAmount !== preAmount) {
-              const accounts = tx.transaction.message.accountKeys;
-              const toAccount = accounts[post.accountIndex];
-              const fromAccount = accounts[pre?.accountIndex || 0];
-              
-              tokenTransfers.push({
-                mint: post.mint,
-                toUserAccount: typeof toAccount === 'string' ? toAccount : (toAccount?.pubkey || ''),
-                fromUserAccount: typeof fromAccount === 'string' ? fromAccount : (fromAccount?.pubkey || ''),
-                tokenAmount: Math.abs(postAmount - preAmount)
-              });
-            }
-          });
-        }
-        
-        if (tx.meta && tx.meta.postBalances && tx.meta.preBalances) {
-          tx.meta.postBalances.forEach((post, idx) => {
-            const pre = tx.meta.preBalances[idx] || 0;
-            if (post !== pre) {
-              const accounts = tx.transaction.message.accountKeys;
-              const account = accounts[idx];
-              const accountStr = typeof account === 'string' ? account : (account?.pubkey || '');
-              
-              nativeTransfers.push({
-                fromUserAccount: accountStr,
-                toUserAccount: accountStr,
-                amount: Math.abs(post - pre)
-              });
-            }
-          });
-        }
-        
-        return {
-          signature: tx.transaction.signatures[0],
-          timestamp: tx.blockTime,
-          type: tokenTransfers.length > 0 ? 'SWAP' : 'TRANSFER',
-          tokenTransfers,
-          nativeTransfers
-        };
-      }).filter(Boolean);
-    } catch (e) {
-      console.error('QuickNode error:', e.message);
-      return null;
-    }
-  } else {
-    try {
-      const res = await fetch(`https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${HELIUS_API_KEY}&limit=${limit}`);
-      return await res.json();
-    } catch (e) {
-      return null;
-    }
-  }
-}
-
-async function getWalletBalances(addr) {
-  if (useQuickNode) {
-    try {
-      const response = await fetch(QUICKNODE_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTokenAccountsByOwner',
-          params: [addr, { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' }, { encoding: 'jsonParsed' }]
-        })
-      });
-      const data = await response.json();
-      if (data.error || !data.result) return [];
-      return data.result.value.map(account => ({
-        mint: account.account.data.parsed.info.mint,
-        amount: account.account.data.parsed.info.tokenAmount.uiAmount
-      }));
-    } catch (e) {
-      return [];
-    }
-  } else {
-    try {
-      const res = await fetch(`https://api.helius.xyz/v0/addresses/${addr}/balances?api-key=${HELIUS_API_KEY}`);
-      const data = await res.json();
-      if (data && data.error) return [];
-      if (!data || !data.tokens) return [];
-      return data.tokens.map(t => ({ mint: t.mint, amount: t.amount / Math.pow(10, t.decimals || 9) }));
-    } catch (e) {
-      return [];
-    }
+      if (tx.meta?.postBalances && tx.meta?.preBalances) {
+        tx.meta.postBalances.forEach((post, idx) => {
+          const pre = tx.meta.preBalances[idx] || 0;
+          if (post !== pre) {
+            const accounts = tx.transaction.message.accountKeys;
+            const acc = accounts[idx];
+            const accStr = typeof acc === 'string' ? acc : (acc?.pubkey || '');
+            nativeTransfers.push({ fromUserAccount: accStr, toUserAccount: accStr, amount: Math.abs(post - pre) });
+          }
+        });
+      }
+      
+      return {
+        signature: tx.transaction.signatures[0],
+        timestamp: tx.blockTime,
+        type: tokenTransfers.length > 0 ? 'SWAP' : 'TRANSFER',
+        tokenTransfers,
+        nativeTransfers
+      };
+    }).filter(Boolean);
+  } catch (e) {
+    console.error('QuickNode error:', e.message);
+    return null;
   }
 }
 
 async function findFunding(addr) {
   const txs = await getWalletTransactions(addr, 100);
-  if (!txs || !Array.isArray(txs)) return null;
+  if (!txs?.length) return null;
   try {
     const deps = {};
     txs.forEach(tx => {
-      if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
+      tx.nativeTransfers?.forEach(t => {
         if (t.toUserAccount === addr && t.fromUserAccount !== addr) {
-          if (!deps[t.fromUserAccount]) deps[t.fromUserAccount] = 0;
-          deps[t.fromUserAccount] += t.amount / 1e9;
+          deps[t.fromUserAccount] = (deps[t.fromUserAccount] || 0) + t.amount / 1e9;
         }
       });
     });
     const sorted = Object.entries(deps).sort((a, b) => b[1] - a[1]);
-    if (sorted.length === 0 || BLACKLISTED.has(sorted[0][0])) return null;
+    if (!sorted.length || BLACKLISTED.has(sorted[0][0])) return null;
     return { fundingWallet: sorted[0][0], totalFunded: sorted[0][1] };
-  } catch (e) {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function findCluster(funding) {
   const txs = await getWalletTransactions(funding, 200);
-  if (!txs || !Array.isArray(txs)) return [];
+  if (!txs?.length) return [];
   try {
     const wallets = new Set();
     txs.forEach(tx => {
-      if (tx.nativeTransfers) tx.nativeTransfers.forEach(t => {
+      tx.nativeTransfers?.forEach(t => {
         if (t.fromUserAccount === funding && t.toUserAccount !== funding) wallets.add(t.toUserAccount);
       });
     });
     return Array.from(wallets);
-  } catch (e) {
-    return [];
-  }
+  } catch { return []; }
 }
 
 async function monitorWallet(addr) {
   const txs = await getWalletTransactions(addr, 5);
-  if (!txs || !Array.isArray(txs) || txs.length === 0) return null;
+  if (!txs?.length) return null;
   try {
     const tx = txs[0];
     const lastSeen = activeAlerts.get(addr)?.timestamp || 0;
@@ -340,8 +214,8 @@ async function monitorWallet(addr) {
         return alert;
       }
     }
-    return null;
-  } catch { return null; }
+  } catch {}
+  return null;
 }
 
 setInterval(async () => {
@@ -350,9 +224,9 @@ setInterval(async () => {
   for (const [addr, data] of trackedWallets) {
     const alert = await monitorWallet(addr);
     if (alert) {
-      console.log('🚨 Trade detected:', addr.slice(0, 8));
+      console.log('🚨 Trade:', addr.slice(0, 8));
       await alertTrade(alert);
-      if (!data.alerts) data.alerts = [];
+      data.alerts = data.alerts || [];
       data.alerts.unshift(alert);
       data.alerts = data.alerts.slice(0, 20);
     }
@@ -366,7 +240,7 @@ async function loadTokens() {
     const data = await res.json();
     data.tokens.forEach(t => tokenCache[t.address] = { symbol: t.symbol, name: t.name });
     console.log('✅ Loaded', Object.keys(tokenCache).length, 'tokens');
-  } catch (e) {}
+  } catch {}
 }
 
 function isBot(w) {
@@ -387,9 +261,7 @@ function getTier(p) {
 }
 
 app.get('/api/discover', async (req, res) => {
-  if (isDiscovering) {
-    return res.status(429).json({ success: false, error: 'Discovery in progress' });
-  }
+  if (isDiscovering) return res.status(429).json({ success: false, error: 'Discovery in progress' });
   isDiscovering = true;
   
   try {
@@ -397,69 +269,51 @@ app.get('/api/discover', async (req, res) => {
     const top = Math.min(parseInt(req.query.top) || 5, 10);
     const alert = req.query.alert === 'true';
 
-    console.log('=== SMART MONEY DISCOVERY START ===');
-
+    console.log('=== SMART MONEY DISCOVERY ===');
     let tokens = [];
     
-    // Check if manual token list is provided
-    if (TARGET_TOKENS && TARGET_TOKENS.trim()) {
-      console.log('📋 Using manual token list from TARGET_TOKENS');
-      const addresses = TARGET_TOKENS.split(',').map(addr => addr.trim()).filter(addr => addr.length > 0);
-      
-      // Fetch token data from Birdeye for each address
+    if (TARGET_TOKENS?.trim()) {
+      console.log('📋 Using manual token list');
+      const addresses = TARGET_TOKENS.split(',').map(a => a.trim()).filter(a => a.length > 0);
       for (const address of addresses.slice(0, limit)) {
         try {
           const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${address}`, {
             headers: { 'X-API-KEY': BIRDEYE_API_KEY }
           });
           const data = await res.json();
-          
           if (data.success && data.data) {
             tokens.push({
-              baseToken: { address: address, symbol: data.data.symbol || 'UNKNOWN' },
+              baseToken: { address, symbol: data.data.symbol || 'UNKNOWN' },
               priceChange: { h24: data.data.v24hChangePercent || 0 },
               volume24h: data.data.v24hUSD || 0,
               marketCap: data.data.mc || 0
             });
           }
-          await new Promise(r => setTimeout(r, 500)); // Rate limit
-        } catch (e) {
-          console.log(`  ⚠️ Failed to fetch data for ${address.slice(0, 8)}`);
-        }
+          await new Promise(r => setTimeout(r, 500));
+        } catch {}
       }
-      console.log(`✅ Loaded ${tokens.length} tokens from manual list`);
+      console.log(`✅ Loaded ${tokens.length} tokens`);
     } else {
-      // Fallback to Birdeye auto-discovery
-      console.log('🔍 Auto-discovering tokens from Birdeye (no TARGET_TOKENS set)');
-      try {
-        const birdeyeRes = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, {
-          headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
-        });
-        const birdeyeData = await birdeyeRes.json();
-        if (birdeyeData.data && birdeyeData.data.tokens) {
-          tokens = birdeyeData.data.tokens
-            .filter(t => {
-              const volume24h = t.v24hUSD || 0;
-              const marketCap = t.mc || 0;
-              return volume24h >= 10000 && marketCap > 0 && marketCap < 10000000;
-            })
-            .map(t => ({
-              baseToken: { address: t.address, symbol: t.symbol },
-              priceChange: { h24: t.v24hChangePercent || 0 },
-              volume24h: t.v24hUSD || 0,
-              marketCap: t.mc || 0
-            }))
-            .slice(0, limit);
-          console.log(`✅ Birdeye: ${tokens.length} tokens (sorted by volume, filtered for <$10M cap)`);
-        }
-      } catch (e) {
-        console.log(`❌ Birdeye error:`, e.message);
+      console.log('🔍 Auto-discovering tokens');
+      const res = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, {
+        headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
+      });
+      const data = await res.json();
+      if (data.data?.tokens) {
+        tokens = data.data.tokens
+          .filter(t => (t.v24hUSD || 0) >= 10000 && (t.mc || 0) > 0 && (t.mc || 0) < 10000000)
+          .map(t => ({
+            baseToken: { address: t.address, symbol: t.symbol },
+            priceChange: { h24: t.v24hChangePercent || 0 },
+            volume24h: t.v24hUSD || 0,
+            marketCap: t.mc || 0
+          }))
+          .slice(0, limit);
+        console.log(`✅ Found ${tokens.length} tokens`);
       }
     }
 
-    if (tokens.length === 0) {
-      return res.json({ success: false, error: 'No tokens found' });
-    }
+    if (!tokens.length) return res.json({ success: false, error: 'No tokens found' });
 
     const scores = {};
     const tokenData = {};
@@ -479,9 +333,8 @@ app.get('/api/discover', async (req, res) => {
         await new Promise(r => setTimeout(r, 2000));
         
         const buyers = await getTokenBuyers(mint, 50);
-        
-        if (buyers.length === 0) {
-          console.log(`  ⚠️ No buyers found`);
+        if (!buyers.length) {
+          console.log(`  ⚠️ No buyers`);
           continue;
         }
         
@@ -489,20 +342,13 @@ app.get('/api/discover', async (req, res) => {
         analyzed++;
         
         const sorted = buyers.sort((a, b) => a.timestamp - b.timestamp);
-        
         sorted.forEach(({ wallet, timestamp }, i) => {
           if (BLACKLISTED.has(wallet) || isProgram(wallet)) return;
           
           if (!scores[wallet]) {
             scores[wallet] = { 
-              address: wallet, 
-              earlyEntryScore: 0, 
-              successScore: 0, 
-              totalTokens: 0, 
-              earlyBuyCount: 0, 
-              lastActivity: 0, 
-              tokensFound: [],
-              volumeScore: 0
+              address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, 
+              earlyBuyCount: 0, lastActivity: 0, tokensFound: [], volumeScore: 0
             };
           }
           
@@ -511,15 +357,9 @@ app.get('/api/discover', async (req, res) => {
           w.lastActivity = Math.max(w.lastActivity, timestamp);
           
           const percentile = ((i + 1) / sorted.length) * 100;
-          if (percentile <= 5) { 
-            w.earlyEntryScore += 15;
-            w.earlyBuyCount++; 
-          } else if (percentile <= 10) { 
-            w.earlyEntryScore += 10;
-            w.earlyBuyCount++; 
-          } else if (percentile <= 20) {
-            w.earlyEntryScore += 5;
-          }
+          if (percentile <= 5) { w.earlyEntryScore += 15; w.earlyBuyCount++; }
+          else if (percentile <= 10) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
+          else if (percentile <= 20) w.earlyEntryScore += 5;
           
           const volume = tokenData[mint].volume24h;
           if (volume > 1000000) w.volumeScore += 10;
@@ -531,38 +371,32 @@ app.get('/api/discover', async (req, res) => {
           else if (perf > 50) w.successScore += 10;
           else if (perf > 20) w.successScore += 5;
           
-          w.tokensFound.push({ 
-            symbol: tokenData[mint].symbol, 
-            performance: perf,
-            volume: volume,
-            marketCap: tokenData[mint].marketCap
-          });
+          w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf, volume, marketCap: tokenData[mint].marketCap });
         });
         
         const topWallet = Object.values(scores).sort((a, b) => b.totalTokens - a.totalTokens)[0];
-        if (topWallet) console.log(`  🔝 Top wallet: ${topWallet.totalTokens} tokens`);
-        
+        if (topWallet) console.log(`  🔝 Top: ${topWallet.totalTokens} tokens`);
       } catch (e) {
-        console.error(`  ❌ Error for ${token.baseToken.symbol}:`, e.message);
+        console.error(`  ❌ Error:`, e.message);
       }
     }
 
-    console.log(`Found ${Object.keys(scores).length} unique wallets`);
+    console.log(`Found ${Object.keys(scores).length} wallets`);
     
     const candidates = Object.values(scores)
       .filter(w => !isBot(w) && w.totalTokens >= 2)
       .sort((a, b) => {
-        const scoreA = a.earlyEntryScore + a.volumeScore + (a.successScore * 0.5);
-        const scoreB = b.earlyEntryScore + b.volumeScore + (b.successScore * 0.5);
-        return scoreB - scoreA;
+        const sA = a.earlyEntryScore + a.volumeScore + (a.successScore * 0.5);
+        const sB = b.earlyEntryScore + b.volumeScore + (b.successScore * 0.5);
+        return sB - sA;
       })
       .slice(0, top * 2);
     
-    console.log(`Smart money candidates (2+ tokens): ${candidates.length}`);
+    console.log(`Candidates: ${candidates.length}`);
     
     const elite = [];
     for (const w of candidates) {
-      console.log(`Analyzing ${w.address.slice(0, 8)}... (${w.earlyBuyCount} early buys, ${w.totalTokens} tokens)`);
+      console.log(`Analyzing ${w.address.slice(0, 8)}...`);
       
       const funding = await findFunding(w.address);
       let cluster = [];
@@ -574,7 +408,6 @@ app.get('/api/discover', async (req, res) => {
       w.fundingWallet = funding?.fundingWallet || null;
       w.clusterSize = cluster.length;
       w.totalScore = w.earlyEntryScore + w.volumeScore + (w.successScore * 0.5);
-      
       elite.push(w);
       
       await new Promise(r => setTimeout(r, 1000));
@@ -600,7 +433,7 @@ app.get('/api/discover', async (req, res) => {
       };
     });
 
-    if (alert && discovered.length > 0) {
+    if (alert && discovered.length) {
       for (const w of discovered.slice(0, 3)) {
         await alertElite(w);
         await new Promise(r => setTimeout(r, 1000));
@@ -625,7 +458,7 @@ app.post('/api/track/:address', async (req, res) => {
   if (trackedWallets.has(address)) return res.json({ success: false });
   trackedWallets.set(address, { address, addedAt: Date.now(), alerts: [] });
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    await sendTelegram(`✅ <b>Tracking</b>\n\n<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\nTotal: ${trackedWallets.size}`);
+    await sendTelegram(`✅ Tracking <code>${address.slice(0, 6)}...${address.slice(-4)}</code>`);
   }
   res.json({ success: true, trackedCount: trackedWallets.size });
 });
@@ -662,19 +495,15 @@ app.post('/api/telegram/test', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Elite Tracker v4.0 - Smart Money Discovery',
+    status: 'Elite Tracker v4.1 - Smart Money Discovery',
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
-    endpoints: {
-      discover: '/api/discover?limit=20&top=5&alert=true',
-      track: 'POST /api/track/:address',
-      tracked: '/api/tracked',
-      test: '/api/telegram/test'
-    }
+    manualTokens: { enabled: !!TARGET_TOKENS, count: TARGET_TOKENS ? TARGET_TOKENS.split(',').length : 0 }
   });
 });
 
 loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v4.0 - Smart Money Discovery');
+  console.log('🚀 Elite Tracker v4.1');
   console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
+  console.log('📋 Manual Tokens:', TARGET_TOKENS ? `✅ (${TARGET_TOKENS.split(',').length})` : '❌');
 });
