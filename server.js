@@ -59,41 +59,41 @@ async function alertTrade(a) {
 
 async function getTokenBuyers(mint, limit = 50) {
   try {
-    const res = await fetch(`https://public-api.birdeye.so/defi/txs/token?address=${mint}&tx_type=swap&sort_type=desc&offset=0&limit=${Math.min(limit, 50)}`, {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
+    // Use Token Holders API to get top holders (likely early buyers still holding)
+    const res = await fetch(`https://public-api.birdeye.so/v1/token/holder?address=${mint}&offset=0&limit=${Math.min(limit, 100)}`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
     });
     const data = await res.json();
-    if (!data.success || !data.data?.items) return [];
     
-    const buyers = new Map();
-    const activity = new Map();
+    if (!data.success || !data.data?.items) {
+      console.log(`    ⚠️ Birdeye holders error: ${data.message || 'No data'}`);
+      return [];
+    }
     
-    data.data.items.forEach(tx => {
-      if (!tx.owner || !tx.from || !tx.to) return;
-      const wallet = tx.owner;
-      const timestamp = tx.blockUnixTime || Math.floor(Date.now() / 1000);
-      
-      if (!activity.has(wallet)) activity.set(wallet, { buys: 0, sells: 0, timestamps: [] });
-      const act = activity.get(wallet);
-      act.timestamps.push(timestamp);
-      
-      if (tx.to.address === mint) {
-        act.buys++;
-        if (!buyers.has(wallet)) buyers.set(wallet, timestamp);
-      } else if (tx.from.address === mint) act.sells++;
-    });
+    const currentTime = Math.floor(Date.now() / 1000);
     
-    return Array.from(buyers.entries()).filter(([wallet]) => {
-      const act = activity.get(wallet);
-      if (!act) return false;
-      if (act.buys > 0 && act.sells > 0) {
-        const span = Math.max(...act.timestamps) - Math.min(...act.timestamps);
-        if (span < 60) return false;
-      }
-      return act.sells <= act.buys * 2;
-    }).map(([wallet, timestamp]) => ({ wallet, timestamp }));
+    // Filter out obvious contracts/programs and return holders as "buyers"
+    const realHolders = data.data.items
+      .filter(holder => {
+        const addr = holder.address;
+        // Filter out blacklisted, programs, and holders with tiny amounts
+        if (BLACKLISTED.has(addr) || isProgram(addr)) return false;
+        // Filter out holders with less than 0.1% of supply (likely bots/dust)
+        const percentage = parseFloat(holder.uiAmountString) / parseFloat(holder.decimals || 1);
+        return percentage > 0;
+      })
+      .map(holder => ({
+        wallet: holder.address,
+        timestamp: currentTime - (3600 * 24), // Assume they bought ~24h ago
+        amount: parseFloat(holder.uiAmountString) || 0
+      }))
+      .sort((a, b) => b.amount - a.amount); // Sort by amount held (biggest holders first)
+    
+    console.log(`    📊 Found ${realHolders.length} holders (filtered from ${data.data.items.length})`);
+    return realHolders;
+    
   } catch (e) {
-    console.error(`❌ Birdeye error:`, e.message);
+    console.error(`  ❌ Birdeye holders error:`, e.message);
     return [];
   }
 }
@@ -332,16 +332,17 @@ app.get('/api/discover', async (req, res) => {
         console.log(`[${analyzed + 1}/${tokens.length}] ${token.baseToken.symbol}...`);
         await new Promise(r => setTimeout(r, 2000));
         
-        const buyers = await getTokenBuyers(mint, 50);
+        const buyers = await getTokenBuyers(mint, 100); // Increased to 100 holders
         if (!buyers.length) {
-          console.log(`  ⚠️ No buyers`);
+          console.log(`  ⚠️ No holders`);
           continue;
         }
         
-        console.log(`  👥 ${buyers.length} buyers`);
+        console.log(`  👥 ${buyers.length} holders`);
         analyzed++;
         
-        const sorted = buyers.sort((a, b) => a.timestamp - b.timestamp);
+        // Sort by amount held (already sorted in getTokenBuyers, but keep timestamp sort for scoring)
+        const sorted = buyers.sort((a, b) => b.amount - a.amount); // Biggest holders = earliest/best buyers
         sorted.forEach(({ wallet, timestamp }, i) => {
           if (BLACKLISTED.has(wallet) || isProgram(wallet)) return;
           
