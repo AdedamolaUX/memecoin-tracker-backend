@@ -43,7 +43,7 @@ async function sendTelegram(msg) {
 
 async function alertElite(w) {
   const ws = w.address.slice(0, 6) + '...' + w.address.slice(-4);
-  let msg = `💎 <b>SMART MONEY #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n⭐ Score: ${w.smartMoneyScore}\n🎯 ${w.earlyBuys} early\n📊 ${w.totalTokensTraded} tokens\n`;
+  let msg = `💎 <b>SMART MONEY #${w.rank}</b>\n\n${w.badge} ${w.tier}\n<code>${ws}</code>\n\n⭐ Score: ${w.smartMoneyScore}\n💰 Profit: $${w.profitUSD} (${w.profitSOL} SOL)\n💼 Portfolio: $${w.portfolioValue} (${w.portfolioTokens} tokens)\n🎯 ${w.earlyBuys} early buys\n`;
   if (w.fundingWallet) msg += `👥 Cluster: ${w.clusterSize}\n`;
   msg += `\n🔗 <a href="https://solscan.io/account/${w.address}">Solscan</a>`;
   await sendTelegram(msg);
@@ -61,8 +61,6 @@ async function getTokenBuyers(mint, limit = 150) {
   try {
     const buyers = new Map();
     const activity = new Map();
-    
-    // Make multiple requests to get more transactions (50 per request, max 3 requests = 150 txs)
     const numRequests = Math.min(Math.ceil(limit / 50), 3);
     
     for (let i = 0; i < numRequests; i++) {
@@ -92,33 +90,70 @@ async function getTokenBuyers(mint, limit = 150) {
         } else if (tx.from.address === mint) act.sells++;
       });
       
-      // Small delay between requests to avoid rate limits
       if (i < numRequests - 1) await new Promise(r => setTimeout(r, 300));
     }
     
-    // Filter out bots and AMMs
     const realBuyers = Array.from(buyers.entries()).filter(([wallet]) => {
       const act = activity.get(wallet);
       if (!act) return false;
-      
-      // Filter out instant buy/sell (AMM bots)
       if (act.buys > 0 && act.sells > 0) {
         const span = Math.max(...act.timestamps) - Math.min(...act.timestamps);
         if (span < 60) return false;
       }
-      
-      // Filter out market makers (way more sells than buys)
       if (act.sells > act.buys * 2) return false;
-      
       return true;
     }).map(([wallet, timestamp]) => ({ wallet, timestamp }));
     
     console.log(`    📊 Found ${realBuyers.length} buyers from ${buyers.size} total wallets`);
     return realBuyers;
-    
   } catch (e) {
     console.error(`  ❌ Birdeye error:`, e.message);
     return [];
+  }
+}
+
+async function analyzeWalletProfit(address) {
+  try {
+    const res = await fetch(`https://public-api.birdeye.so/v1/wallet/token_list?wallet=${address}`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+    });
+    const data = await res.json();
+    
+    if (!data.success || !data.data) {
+      return { profitable: false, totalProfit: 0, totalValue: 0, tokenCount: 0, profitUSD: 0 };
+    }
+    
+    let totalProfit = 0;
+    let totalValue = 0;
+    let tokenCount = 0;
+    
+    if (data.data.items) {
+      data.data.items.forEach(token => {
+        if (token.uiAmount && token.uiAmount > 0) {
+          tokenCount++;
+          const valueUSD = parseFloat(token.valueUsd) || 0;
+          const priceChange = parseFloat(token.priceChangePercent) || 0;
+          totalValue += valueUSD;
+          if (priceChange > 0) {
+            totalProfit += valueUSD * (priceChange / 100);
+          }
+        }
+      });
+    }
+    
+    const profitSOL = totalProfit / 100;
+    const valueSOL = totalValue / 100;
+    
+    return {
+      profitable: profitSOL > 0.1,
+      totalProfit: profitSOL,
+      totalValue: valueSOL,
+      tokenCount: tokenCount,
+      profitUSD: totalProfit
+    };
+  } catch (e) {
+    console.error(`    ❌ Portfolio error:`, e.message);
+    return { profitable: false, totalProfit: 0, totalValue: 0, tokenCount: 0, profitUSD: 0 };
   }
 }
 
@@ -177,13 +212,7 @@ async function getWalletTransactions(address, limit = 100) {
         });
       }
       
-      return {
-        signature: tx.transaction.signatures[0],
-        timestamp: tx.blockTime,
-        type: tokenTransfers.length > 0 ? 'SWAP' : 'TRANSFER',
-        tokenTransfers,
-        nativeTransfers
-      };
+      return { signature: tx.transaction.signatures[0], timestamp: tx.blockTime, type: tokenTransfers.length > 0 ? 'SWAP' : 'TRANSFER', tokenTransfers, nativeTransfers };
     }).filter(Boolean);
   } catch (e) {
     console.error('QuickNode error:', e.message);
@@ -196,13 +225,7 @@ async function findFunding(addr) {
   if (!txs?.length) return null;
   try {
     const deps = {};
-    txs.forEach(tx => {
-      tx.nativeTransfers?.forEach(t => {
-        if (t.toUserAccount === addr && t.fromUserAccount !== addr) {
-          deps[t.fromUserAccount] = (deps[t.fromUserAccount] || 0) + t.amount / 1e9;
-        }
-      });
-    });
+    txs.forEach(tx => { tx.nativeTransfers?.forEach(t => { if (t.toUserAccount === addr && t.fromUserAccount !== addr) deps[t.fromUserAccount] = (deps[t.fromUserAccount] || 0) + t.amount / 1e9; }); });
     const sorted = Object.entries(deps).sort((a, b) => b[1] - a[1]);
     if (!sorted.length || BLACKLISTED.has(sorted[0][0])) return null;
     return { fundingWallet: sorted[0][0], totalFunded: sorted[0][1] };
@@ -214,11 +237,7 @@ async function findCluster(funding) {
   if (!txs?.length) return [];
   try {
     const wallets = new Set();
-    txs.forEach(tx => {
-      tx.nativeTransfers?.forEach(t => {
-        if (t.fromUserAccount === funding && t.toUserAccount !== funding) wallets.add(t.toUserAccount);
-      });
-    });
+    txs.forEach(tx => { tx.nativeTransfers?.forEach(t => { if (t.fromUserAccount === funding && t.toUserAccount !== funding) wallets.add(t.toUserAccount); }); });
     return Array.from(wallets);
   } catch { return []; }
 }
@@ -267,14 +286,8 @@ async function loadTokens() {
   } catch {}
 }
 
-function isBot(w) {
-  return w.totalTokens > 50 || ((Date.now() / 1000 - w.lastActivity) / 86400 < 1 && w.totalTokens > 10);
-}
-
-function isProgram(addr) {
-  return /pump$/i.test(addr) || /111111/.test(addr) || /AToken/.test(addr) || /ZZZZ/i.test(addr);
-}
-
+function isBot(w) { return w.totalTokens > 50 || ((Date.now() / 1000 - w.lastActivity) / 86400 < 1 && w.totalTokens > 10); }
+function isProgram(addr) { return /pump$/i.test(addr) || /111111/.test(addr) || /AToken/.test(addr) || /ZZZZ/i.test(addr); }
 function getTier(p) {
   if (p >= 95) return { tier: 'LEGENDARY', emoji: '👑', color: '#FFD700' };
   if (p >= 90) return { tier: 'ELITE', emoji: '💎', color: '#B9F2FF' };
@@ -287,189 +300,98 @@ function getTier(p) {
 app.get('/api/discover', async (req, res) => {
   if (isDiscovering) return res.status(429).json({ success: false, error: 'Discovery in progress' });
   isDiscovering = true;
-  
   try {
     const limit = Math.min(parseInt(req.query.limit) || 20, 30);
     const top = Math.min(parseInt(req.query.top) || 5, 10);
     const alert = req.query.alert === 'true';
-
     console.log('=== SMART MONEY DISCOVERY ===');
     let tokens = [];
-    
     if (TARGET_TOKENS?.trim()) {
       console.log('📋 Using manual token list');
       const addresses = TARGET_TOKENS.split(',').map(a => a.trim()).filter(a => a.length > 0);
       for (const address of addresses.slice(0, limit)) {
         try {
-          const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${address}`, {
-            headers: { 'X-API-KEY': BIRDEYE_API_KEY }
-          });
+          const res = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${address}`, { headers: { 'X-API-KEY': BIRDEYE_API_KEY } });
           const data = await res.json();
-          if (data.success && data.data) {
-            tokens.push({
-              baseToken: { address, symbol: data.data.symbol || 'UNKNOWN' },
-              priceChange: { h24: data.data.v24hChangePercent || 0 },
-              volume24h: data.data.v24hUSD || 0,
-              marketCap: data.data.mc || 0
-            });
-          }
+          if (data.success && data.data) tokens.push({ baseToken: { address, symbol: data.data.symbol || 'UNKNOWN' }, priceChange: { h24: data.data.v24hChangePercent || 0 }, volume24h: data.data.v24hUSD || 0, marketCap: data.data.mc || 0 });
           await new Promise(r => setTimeout(r, 500));
         } catch {}
       }
       console.log(`✅ Loaded ${tokens.length} tokens`);
     } else {
       console.log('🔍 Auto-discovering tokens');
-      const res = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, {
-        headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' }
-      });
+      const res = await fetch(`https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${limit}`, { headers: { 'X-API-KEY': BIRDEYE_API_KEY, 'x-chain': 'solana' } });
       const data = await res.json();
       if (data.data?.tokens) {
-        tokens = data.data.tokens
-          .filter(t => (t.v24hUSD || 0) >= 10000 && (t.mc || 0) > 0 && (t.mc || 0) < 10000000)
-          .map(t => ({
-            baseToken: { address: t.address, symbol: t.symbol },
-            priceChange: { h24: t.v24hChangePercent || 0 },
-            volume24h: t.v24hUSD || 0,
-            marketCap: t.mc || 0
-          }))
-          .slice(0, limit);
+        tokens = data.data.tokens.filter(t => (t.v24hUSD || 0) >= 10000 && (t.mc || 0) > 0 && (t.mc || 0) < 10000000).map(t => ({ baseToken: { address: t.address, symbol: t.symbol }, priceChange: { h24: t.v24hChangePercent || 0 }, volume24h: t.v24hUSD || 0, marketCap: t.mc || 0 })).slice(0, limit);
         console.log(`✅ Found ${tokens.length} tokens`);
       }
     }
-
     if (!tokens.length) return res.json({ success: false, error: 'No tokens found' });
-
     const scores = {};
     const tokenData = {};
     let analyzed = 0;
-
     for (const token of tokens) {
       const mint = token.baseToken.address;
-      tokenData[mint] = { 
-        symbol: token.baseToken.symbol, 
-        change24h: token.priceChange?.h24 || 0,
-        volume24h: token.volume24h || 0,
-        marketCap: token.marketCap || 0
-      };
-      
+      tokenData[mint] = { symbol: token.baseToken.symbol, change24h: token.priceChange?.h24 || 0, volume24h: token.volume24h || 0, marketCap: token.marketCap || 0 };
       try {
         console.log(`[${analyzed + 1}/${tokens.length}] ${token.baseToken.symbol}...`);
         await new Promise(r => setTimeout(r, 2000));
-        
-        const buyers = await getTokenBuyers(mint, 150); // Get 150 transactions (3 requests x 50)
-        if (!buyers.length) {
-          console.log(`  ⚠️ No buyers`);
-          continue;
-        }
-        
+        const buyers = await getTokenBuyers(mint, 150);
+        if (!buyers.length) { console.log(`  ⚠️ No buyers`); continue; }
         console.log(`  👥 ${buyers.length} buyers`);
         analyzed++;
-        
-        const sorted = buyers.sort((a, b) => a.timestamp - b.timestamp); // Earliest buyers first
+        const sorted = buyers.sort((a, b) => a.timestamp - b.timestamp);
         sorted.forEach(({ wallet, timestamp }, i) => {
           if (BLACKLISTED.has(wallet) || isProgram(wallet)) return;
-          
-          if (!scores[wallet]) {
-            scores[wallet] = { 
-              address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, 
-              earlyBuyCount: 0, lastActivity: 0, tokensFound: [], volumeScore: 0
-            };
-          }
-          
+          if (!scores[wallet]) scores[wallet] = { address: wallet, earlyEntryScore: 0, successScore: 0, totalTokens: 0, earlyBuyCount: 0, lastActivity: 0, tokensFound: [], volumeScore: 0 };
           const w = scores[wallet];
           w.totalTokens++;
           w.lastActivity = Math.max(w.lastActivity, timestamp);
-          
           const percentile = ((i + 1) / sorted.length) * 100;
-          if (percentile <= 5) { w.earlyEntryScore += 15; w.earlyBuyCount++; }
-          else if (percentile <= 10) { w.earlyEntryScore += 10; w.earlyBuyCount++; }
-          else if (percentile <= 20) w.earlyEntryScore += 5;
-          
+          if (percentile <= 5) { w.earlyEntryScore += 15; w.earlyBuyCount++; } else if (percentile <= 10) { w.earlyEntryScore += 10; w.earlyBuyCount++; } else if (percentile <= 20) w.earlyEntryScore += 5;
           const volume = tokenData[mint].volume24h;
-          if (volume > 1000000) w.volumeScore += 10;
-          else if (volume > 500000) w.volumeScore += 7;
-          else if (volume > 100000) w.volumeScore += 5;
-          
+          if (volume > 1000000) w.volumeScore += 10; else if (volume > 500000) w.volumeScore += 7; else if (volume > 100000) w.volumeScore += 5;
           const perf = tokenData[mint].change24h;
-          if (perf > 100) w.successScore += 15;
-          else if (perf > 50) w.successScore += 10;
-          else if (perf > 20) w.successScore += 5;
-          
+          if (perf > 100) w.successScore += 15; else if (perf > 50) w.successScore += 10; else if (perf > 20) w.successScore += 5;
           w.tokensFound.push({ symbol: tokenData[mint].symbol, performance: perf, volume, marketCap: tokenData[mint].marketCap });
         });
-        
         const topWallet = Object.values(scores).sort((a, b) => b.totalTokens - a.totalTokens)[0];
         if (topWallet) console.log(`  🔝 Top: ${topWallet.totalTokens} tokens`);
-      } catch (e) {
-        console.error(`  ❌ Error:`, e.message);
-      }
+      } catch (e) { console.error(`  ❌ Error:`, e.message); }
     }
-
     console.log(`Found ${Object.keys(scores).length} wallets`);
-    
-    const candidates = Object.values(scores)
-      .filter(w => !isBot(w) && w.totalTokens >= 2)
-      .sort((a, b) => {
-        const sA = a.earlyEntryScore + a.volumeScore + (a.successScore * 0.5);
-        const sB = b.earlyEntryScore + b.volumeScore + (b.successScore * 0.5);
-        return sB - sA;
-      })
-      .slice(0, top * 2);
-    
+    const candidates = Object.values(scores).filter(w => !isBot(w) && w.totalTokens >= 1).sort((a, b) => { const sA = a.earlyEntryScore + a.volumeScore + (a.successScore * 0.5); const sB = b.earlyEntryScore + b.volumeScore + (b.successScore * 0.5); return sB - sA; }).slice(0, top * 3);
     console.log(`Candidates: ${candidates.length}`);
-    
     const elite = [];
     for (const w of candidates) {
       console.log(`Analyzing ${w.address.slice(0, 8)}...`);
-      
+      await new Promise(r => setTimeout(r, 500));
+      const profit = await analyzeWalletProfit(w.address);
+      console.log(`  💰 Value: $${profit.totalValue.toFixed(2)} | Profit: $${profit.profitUSD.toFixed(2)} | Tokens: ${profit.tokenCount}`);
+      if (!profit.profitable || profit.totalProfit < 0.1) { console.log(`  ❌ Not profitable enough`); continue; }
+      console.log(`  ✅ Profitable trader!`);
       const funding = await findFunding(w.address);
       let cluster = [];
-      if (funding) {
-        cluster = await findCluster(funding.fundingWallet);
-        walletClusters.set(funding.fundingWallet, cluster);
-      }
-      
+      if (funding) { cluster = await findCluster(funding.fundingWallet); walletClusters.set(funding.fundingWallet, cluster); }
       w.fundingWallet = funding?.fundingWallet || null;
       w.clusterSize = cluster.length;
       w.totalScore = w.earlyEntryScore + w.volumeScore + (w.successScore * 0.5);
+      w.totalProfit = profit.totalProfit;
+      w.totalValue = profit.totalValue;
+      w.profitUSD = profit.profitUSD;
+      w.portfolioTokens = profit.tokenCount;
       elite.push(w);
-      
       await new Promise(r => setTimeout(r, 1000));
       if (elite.length >= top) break;
     }
-
     const discovered = elite.map((w, i) => {
       const scorePercent = Math.min(95, 60 + (w.totalScore / 2));
       const tier = getTier(scorePercent);
-      return {
-        rank: i + 1,
-        address: w.address,
-        tier: tier.tier,
-        badge: tier.emoji,
-        tierColor: tier.color,
-        smartMoneyScore: w.totalScore.toFixed(1),
-        earlyBuys: w.earlyBuyCount,
-        totalTokensTraded: w.totalTokens,
-        volumeScore: w.volumeScore,
-        fundingWallet: w.fundingWallet,
-        clusterSize: w.clusterSize,
-        tokensFound: w.tokensFound.slice(0, 3)
-      };
+      return { rank: i + 1, address: w.address, tier: tier.tier, badge: tier.emoji, tierColor: tier.color, smartMoneyScore: w.totalScore.toFixed(1), earlyBuys: w.earlyBuyCount, totalTokensTraded: w.totalTokens, volumeScore: w.volumeScore, portfolioValue: w.totalValue ? w.totalValue.toFixed(2) : '0', profitSOL: w.totalProfit ? w.totalProfit.toFixed(2) : '0', profitUSD: w.profitUSD ? w.profitUSD.toFixed(2) : '0', portfolioTokens: w.portfolioTokens || 0, fundingWallet: w.fundingWallet, clusterSize: w.clusterSize, tokensFound: w.tokensFound.slice(0, 3) };
     });
-
-    if (alert && discovered.length) {
-      for (const w of discovered.slice(0, 3)) {
-        await alertElite(w);
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
-
-    res.json({
-      success: true,
-      discoveredWallets: discovered,
-      stats: { tokensAnalyzed: analyzed, walletsScanned: Object.keys(scores).length, smartMoneyFound: elite.length },
-      telegramEnabled: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)
-    });
+    if (alert && discovered.length) { for (const w of discovered.slice(0, 3)) { await alertElite(w); await new Promise(r => setTimeout(r, 1000)); } }
+    res.json({ success: true, discoveredWallets: discovered, stats: { tokensAnalyzed: analyzed, walletsScanned: Object.keys(scores).length, smartMoneyFound: elite.length }, telegramEnabled: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
@@ -481,9 +403,7 @@ app.post('/api/track/:address', async (req, res) => {
   const { address } = req.params;
   if (trackedWallets.has(address)) return res.json({ success: false });
   trackedWallets.set(address, { address, addedAt: Date.now(), alerts: [] });
-  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    await sendTelegram(`✅ Tracking <code>${address.slice(0, 6)}...${address.slice(-4)}</code>`);
-  }
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) await sendTelegram(`✅ Tracking <code>${address.slice(0, 6)}...${address.slice(-4)}</code>`);
   res.json({ success: true, trackedCount: trackedWallets.size });
 });
 
@@ -495,39 +415,16 @@ app.delete('/api/track/:address', (req, res) => {
   res.json({ success: true, trackedCount: trackedWallets.size });
 });
 
-app.get('/api/tracked', (req, res) => {
-  res.json({ success: true, trackedWallets: Array.from(trackedWallets.values()), count: trackedWallets.size });
-});
-
-app.get('/api/alerts', (req, res) => {
-  res.json({ success: true, alerts: Array.from(activeAlerts.values()).sort((a, b) => b.timestamp - a.timestamp).slice(0, 50) });
-});
-
-app.get('/api/clusters', (req, res) => {
-  res.json({ success: true, clusters: Array.from(walletClusters.entries()).map(([f, w]) => ({ fundingWallet: f, walletCount: w.length, wallets: w.slice(0, 10) })) });
-});
-
-app.get('/api/telegram/test', async (req, res) => {
-  const sent = await sendTelegram('🧪 Test');
-  res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
-});
-
-app.post('/api/telegram/test', async (req, res) => {
-  const sent = await sendTelegram('🧪 Test');
-  res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
-});
-
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'Elite Tracker v4.1 - Smart Money Discovery',
-    telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
-    manualTokens: { enabled: !!TARGET_TOKENS, count: TARGET_TOKENS ? TARGET_TOKENS.split(',').length : 0 }
-  });
-});
+app.get('/api/tracked', (req, res) => { res.json({ success: true, trackedWallets: Array.from(trackedWallets.values()), count: trackedWallets.size }); });
+app.get('/api/alerts', (req, res) => { res.json({ success: true, alerts: Array.from(activeAlerts.values()).sort((a, b) => b.timestamp - a.timestamp).slice(0, 50) }); });
+app.get('/api/clusters', (req, res) => { res.json({ success: true, clusters: Array.from(walletClusters.entries()).map(([f, w]) => ({ fundingWallet: f, walletCount: w.length, wallets: w.slice(0, 10) })) }); });
+app.get('/api/telegram/test', async (req, res) => { const sent = await sendTelegram('🧪 Test'); res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) }); });
+app.post('/api/telegram/test', async (req, res) => { const sent = await sendTelegram('🧪 Test'); res.json({ success: sent, configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) }); });
+app.get('/', (req, res) => { res.json({ status: 'Elite Tracker v4.4', telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) }, manualTokens: { enabled: !!TARGET_TOKENS, count: TARGET_TOKENS ? TARGET_TOKENS.split(',').length : 0 } }); });
 
 loadTokens();
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v4.1');
+  console.log('🚀 Elite Tracker v4.4');
   console.log('📱 Telegram:', TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌');
   console.log('📋 Manual Tokens:', TARGET_TOKENS ? `✅ (${TARGET_TOKENS.split(',').length})` : '❌');
 });
