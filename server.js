@@ -114,46 +114,57 @@ async function getTokenBuyers(mint, limit = 150) {
 
 async function analyzeWalletProfit(address) {
   try {
-    const res = await fetch(`https://public-api.birdeye.so/v1/wallet/token_list?wallet=${address}`, {
+    // Use wallet transaction history to calculate actual realized profit
+    const res = await fetch(`https://public-api.birdeye.so/v1/wallet/tx_list?wallet=${address}&tx_type=swap&limit=100`, {
       headers: { 'X-API-KEY': BIRDEYE_API_KEY }
     });
     const data = await res.json();
     
-    if (!data.success || !data.data) {
-      return { profitable: false, totalProfit: 0, totalValue: 0, tokenCount: 0, profitUSD: 0 };
+    if (!data.success || !data.data?.items) {
+      return { profitable: false, totalProfit: 0, totalValue: 0, tokenCount: 0, profitUSD: 0, tradeCount: 0 };
     }
     
-    let totalProfit = 0;
-    let totalValue = 0;
-    let tokenCount = 0;
+    let solSpent = 0;
+    let solReceived = 0;
+    let tradeCount = 0;
+    const tokensTraded = new Set();
     
-    if (data.data.items) {
-      data.data.items.forEach(token => {
-        if (token.uiAmount && token.uiAmount > 0) {
-          tokenCount++;
-          const valueUSD = parseFloat(token.valueUsd) || 0;
-          const priceChange = parseFloat(token.priceChangePercent) || 0;
-          totalValue += valueUSD;
-          if (priceChange > 0) {
-            totalProfit += valueUSD * (priceChange / 100);
-          }
-        }
-      });
-    }
+    data.data.items.forEach(tx => {
+      if (!tx.from || !tx.to || !tx.solAmount) return;
+      
+      const solAmt = parseFloat(tx.solAmount) || 0;
+      tradeCount++;
+      
+      // Track which tokens they traded
+      if (tx.from.symbol !== 'SOL') tokensTraded.add(tx.from.symbol);
+      if (tx.to.symbol !== 'SOL') tokensTraded.add(tx.to.symbol);
+      
+      // BUY: SOL -> Token (spending SOL)
+      if (tx.from.symbol === 'SOL' && tx.to.symbol !== 'SOL') {
+        solSpent += solAmt;
+      }
+      // SELL: Token -> SOL (receiving SOL)
+      else if (tx.from.symbol !== 'SOL' && tx.to.symbol === 'SOL') {
+        solReceived += solAmt;
+      }
+    });
     
-    const profitSOL = totalProfit / 100;
-    const valueSOL = totalValue / 100;
+    const profitSOL = solReceived - solSpent;
+    const profitUSD = profitSOL * 100; // Rough estimate: $100 per SOL
+    
+    console.log(`    📈 ${tradeCount} swaps | Spent: ${solSpent.toFixed(2)} SOL | Received: ${solReceived.toFixed(2)} SOL`);
     
     return {
       profitable: profitSOL > 0.1,
       totalProfit: profitSOL,
-      totalValue: valueSOL,
-      tokenCount: tokenCount,
-      profitUSD: totalProfit
+      totalValue: solReceived,
+      tokenCount: tokensTraded.size,
+      profitUSD: profitUSD,
+      tradeCount: tradeCount
     };
   } catch (e) {
     console.error(`    ❌ Portfolio error:`, e.message);
-    return { profitable: false, totalProfit: 0, totalValue: 0, tokenCount: 0, profitUSD: 0 };
+    return { profitable: false, totalProfit: 0, totalValue: 0, tokenCount: 0, profitUSD: 0, tradeCount: 0 };
   }
 }
 
@@ -368,7 +379,7 @@ app.get('/api/discover', async (req, res) => {
       console.log(`Analyzing ${w.address.slice(0, 8)}...`);
       await new Promise(r => setTimeout(r, 500));
       const profit = await analyzeWalletProfit(w.address);
-      console.log(`  💰 Value: $${profit.totalValue.toFixed(2)} | Profit: $${profit.profitUSD.toFixed(2)} | Tokens: ${profit.tokenCount}`);
+      console.log(`  💰 Profit: ${profit.profitUSD.toFixed(2)} (${profit.totalProfit.toFixed(2)} SOL) | Trades: ${profit.tradeCount} | Tokens: ${profit.tokenCount}`);
       if (!profit.profitable || profit.totalProfit < 0.1) { console.log(`  ❌ Not profitable enough`); continue; }
       console.log(`  ✅ Profitable trader!`);
       const funding = await findFunding(w.address);
