@@ -60,8 +60,9 @@ async function getTokenBuyersFromSolscan(tokenAddress) {
   try {
     console.log(`    🔍 Fetching transfers for ${tokenAddress.slice(0, 8)}...`);
     
+    // Try the correct Solscan v2 endpoint
     const res = await fetch(
-      `https://pro-api.solscan.io/v1.0/token/transfer?token=${tokenAddress}&page=1&page_size=100`,
+      `https://pro-api.solscan.io/v2.0/token/transfer?address=${tokenAddress}&page=1&page_size=100&remove_spam=true`,
       {
         headers: {
           'token': SOLSCAN_API_KEY,
@@ -72,6 +73,8 @@ async function getTokenBuyersFromSolscan(tokenAddress) {
     
     if (!res.ok) {
       console.log(`    ⚠️ Solscan error: ${res.status} ${res.statusText}`);
+      const errorText = await res.text();
+      console.log(`    🔍 Error response: ${errorText.slice(0, 200)}`);
       return [];
     }
     
@@ -128,7 +131,7 @@ async function analyzeWalletProfitFromSolscan(address) {
     console.log(`    🔍 Fetching transaction history...`);
     
     const res = await fetch(
-      `https://pro-api.solscan.io/v1.0/account/transactions?account=${address}&page=1&page_size=100`,
+      `https://pro-api.solscan.io/v2.0/account/transaction?address=${address}&page=1&page_size=100`,
       {
         headers: {
           'token': SOLSCAN_API_KEY,
