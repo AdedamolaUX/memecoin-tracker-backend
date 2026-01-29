@@ -60,7 +60,6 @@ async function getTokenBuyersFromHelius(tokenAddress) {
   try {
     console.log(`    🔍 Fetching signatures for ${tokenAddress.slice(0, 8)}...`);
     
-    // Get recent signatures for the token account
     const sigRes = await fetch(
       `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
       {
@@ -89,43 +88,48 @@ async function getTokenBuyersFromHelius(tokenAddress) {
     
     console.log(`    📊 Found ${sigData.result.length} signatures, analyzing...`);
     
-    // Get transaction details
-    const signatures = sigData.result.slice(0, 50).map(s => s.signature); // Limit to 50 to avoid rate limits
+    // Get transactions one by one
+    const transactions = [];
+    const signatures = sigData.result.slice(0, 30).map(s => s.signature);
     
-    const txRes = await fetch(
-      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTransactions',
-          params: [signatures]
-        })
-      }
-    );
-    
-    const txData = await txRes.json();
-    
-    if (txData.error) {
-      console.log(`    ⚠️ Helius tx error: ${txData.error.message}`);
-      return [];
+    for (const sig of signatures) {
+      const txRes = await fetch(
+        `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTransaction',
+            params: [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+          })
+        }
+      );
+      
+      const txData = await txRes.json();
+      if (txData.result) transactions.push(txData.result);
+      await new Promise(r => setTimeout(r, 50));
     }
     
     // Parse transactions to find buyers
-    for (const tx of txData.result || []) {
+    for (const tx of transactions) {
       if (!tx || tx.meta?.err) continue;
       
-      const accounts = tx.transaction?.message?.accountKeys || [];
-      if (accounts.length < 2) continue;
+      const accountKeys = tx.transaction?.message?.accountKeys;
+      if (!accountKeys || accountKeys.length < 2) continue;
       
-      // First non-program account is usually the signer (buyer)
-      const signer = accounts[0];
-      if (!signer || typeof signer !== 'string') continue;
-      if (BLACKLISTED.has(signer)) continue;
+      // Get the signer (first account)
+      let signer;
+      if (typeof accountKeys[0] === 'string') {
+        signer = accountKeys[0];
+      } else if (accountKeys[0]?.pubkey) {
+        signer = accountKeys[0].pubkey;
+      }
       
-      // Check if this is a token transfer
+      if (!signer || BLACKLISTED.has(signer)) continue;
+      
+      // Check if this involves token transfers
       const hasTokenTransfer = tx.meta?.postTokenBalances?.length > 0;
       if (!hasTokenTransfer) continue;
       
@@ -133,19 +137,17 @@ async function getTokenBuyersFromHelius(tokenAddress) {
         walletMap.set(signer, {
           address: signer,
           firstSeen: tx.blockTime || Date.now() / 1000,
-          buyCount: 0,
-          totalAmount: 0
+          buyCount: 0
         });
       }
       
-      const wallet = walletMap.get(signer);
-      wallet.buyCount++;
+      walletMap.get(signer).buyCount++;
     }
     
     const buyers = Array.from(walletMap.values())
       .sort((a, b) => a.firstSeen - b.firstSeen);
     
-    console.log(`    📊 Found ${buyers.length} unique buyers from ${signatures.length} transactions`);
+    console.log(`    📊 Found ${buyers.length} unique buyers from ${transactions.length} transactions`);
     
     return buyers;
     
@@ -161,7 +163,6 @@ async function analyzeWalletProfitFromHelius(address) {
     
     console.log(`    🔍 Fetching transaction history...`);
     
-    // Get wallet signatures
     const sigRes = await fetch(
       `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
       {
@@ -185,28 +186,28 @@ async function analyzeWalletProfitFromHelius(address) {
     
     console.log(`    🔍 DEBUG - Found ${sigData.result.length} transactions`);
     
-    // Get detailed transactions
+    // Get transactions one by one
+    const transactions = [];
     const signatures = sigData.result.slice(0, 50).map(s => s.signature);
     
-    const txRes = await fetch(
-      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTransactions',
-          params: [signatures]
-        })
-      }
-    );
-    
-    const txData = await txRes.json();
-    
-    if (txData.error || !txData.result) {
-      console.log(`    ⚠️ Error fetching transaction details`);
-      return { profit: 0, profitUSD: 0, swapCount: 0, tokenCount: 0 };
+    for (const sig of signatures) {
+      const txRes = await fetch(
+        `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTransaction',
+            params: [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+          })
+        }
+      );
+      
+      const txData = await txRes.json();
+      if (txData.result) transactions.push(txData.result);
+      await new Promise(r => setTimeout(r, 50));
     }
     
     let solSpent = 0;
@@ -215,26 +216,25 @@ async function analyzeWalletProfitFromHelius(address) {
     const tokensTraded = new Set();
     
     // Analyze transactions
-    for (const tx of txData.result) {
+    for (const tx of transactions) {
       if (!tx || tx.meta?.err) continue;
       
-      // Count swaps (transactions with token balance changes)
+      // Count swaps
       const hasTokenChange = tx.meta?.postTokenBalances?.length > 0;
       if (hasTokenChange) {
         swapCount++;
         
-        // Track unique tokens
         for (const balance of tx.meta.postTokenBalances || []) {
           if (balance.mint) tokensTraded.add(balance.mint);
         }
       }
       
-      // Calculate SOL flow from pre/post balances
+      // Calculate SOL flow
       const preBalance = tx.meta?.preBalances?.[0] || 0;
       const postBalance = tx.meta?.postBalances?.[0] || 0;
       const fee = tx.meta?.fee || 0;
       
-      const netChange = (postBalance - preBalance + fee) / 1e9; // Convert lamports to SOL
+      const netChange = (postBalance - preBalance + fee) / 1e9;
       
       if (netChange < 0) {
         solSpent += Math.abs(netChange);
@@ -244,9 +244,9 @@ async function analyzeWalletProfitFromHelius(address) {
     }
     
     const profitSOL = solReceived - solSpent;
-    const profitUSD = profitSOL * 180; // Approximate SOL price
+    const profitUSD = profitSOL * 180;
     
-    console.log(`    📈 ${txData.result.length} txs, ${swapCount} swaps`);
+    console.log(`    📈 ${transactions.length} txs, ${swapCount} swaps`);
     console.log(`    📈 Spent: ${solSpent.toFixed(3)} SOL | Received: ${solReceived.toFixed(3)} SOL`);
     console.log(`    💰 Profit: $${profitUSD.toFixed(2)} (${profitSOL.toFixed(3)} SOL) | Tokens: ${tokensTraded.size}`);
     
@@ -278,7 +278,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     console.log('📋 Using manual token list');
     console.log(`✅ Loaded ${tokens.length} tokens`);
   } else {
-    console.log('❌ No TARGET_TOKENS configured. Please add token addresses.');
+    console.log('❌ No TARGET_TOKENS configured.');
     return { discoveredWallets: [], stats: {} };
   }
   
@@ -315,13 +315,12 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       const w = scores[wallet];
       w.totalTokens++;
       
-      // Reward early entry
       const buyerRank = buyers.findIndex(b => b.address === wallet);
       const percentile = buyerRank / buyers.length;
       
-      if (percentile <= 0.05) w.earlyEntryScore += 15;      // Top 5%
-      else if (percentile <= 0.10) w.earlyEntryScore += 10; // Top 10%
-      else if (percentile <= 0.20) w.earlyEntryScore += 5;  // Top 20%
+      if (percentile <= 0.05) w.earlyEntryScore += 15;
+      else if (percentile <= 0.10) w.earlyEntryScore += 10;
+      else if (percentile <= 0.20) w.earlyEntryScore += 5;
     }
     
     const topWallet = Object.values(scores).sort((a, b) => b.totalTokens - a.totalTokens)[0];
@@ -329,8 +328,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       console.log(`  🔝 Top wallet bought ${topWallet.totalTokens} of your tokens`);
     }
     
-    // Rate limiting
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 2000));
   }
   
   const walletList = Object.values(scores);
@@ -355,7 +353,6 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     
     const analysis = await analyzeWalletProfitFromHelius(wallet.address);
     
-    // Lower threshold for testing - just need active trading
     if (analysis.profitUSD >= 5 || analysis.profit >= 0.05 || analysis.swapCount >= 10) {
       console.log(`  ✅ SMART MONEY WALLET!`);
       profitable.push({
@@ -366,7 +363,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       console.log(`  ❌ Not enough trading activity`);
     }
     
-    await new Promise(r => setTimeout(r, 1500)); // Rate limiting
+    await new Promise(r => setTimeout(r, 2000));
   }
   
   console.log(`\n\n🎯 === RESULTS ===`);
@@ -381,7 +378,6 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     }
   }
   
-  // Track profitable wallets
   for (const wallet of profitable) {
     trackedWallets.set(wallet.address, {
       address: wallet.address,
@@ -393,7 +389,6 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     });
   }
   
-  // Send Telegram alert
   if (profitable.length > 0 && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     const msg = `🎯 <b>Smart Money Found!</b>\n\n${profitable.slice(0, 5).map(w => 
       `<code>${w.address.slice(0, 6)}...${w.address.slice(-4)}</code>\n💰 $${w.profitUSD.toFixed(2)} | ${w.swapCount} trades | ${w.totalTokens} of your tokens`
@@ -458,7 +453,7 @@ app.get('/api/tracked', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    status: 'Elite Tracker v5.1 - Helius Integration',
+    status: 'Elite Tracker v5.1 - Helius Integration (Fixed)',
     helius: { configured: !!HELIUS_API_KEY },
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     manualTokens: {
@@ -476,7 +471,7 @@ app.get('/', (req, res) => {
 loadTokens();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v5.1 - Helius Integration');
+  console.log('🚀 Elite Tracker v5.1 - Helius Integration (Fixed)');
   console.log(`📱 Telegram: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌'}`);
   console.log(`🔑 Helius: ${HELIUS_API_KEY ? '✅' : '❌'}`);
   console.log(`📋 Manual Tokens: ${TARGET_TOKENS ? `✅ (${TARGET_TOKENS.split(',').length} tokens)` : '❌'}`);
