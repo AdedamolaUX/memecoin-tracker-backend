@@ -27,6 +27,9 @@ let knownTokens = new Map();
 const trackedWallets = new Map();
 const activeAlerts = new Map();
 const walletClusters = new Map();
+const lastSeenSignatures = new Map(); // Track last seen tx for each wallet
+
+let monitoringInterval = null;
 
 async function sendTelegram(msg) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
@@ -183,7 +186,6 @@ async function analyzeWalletProfitFromHelius(address) {
     
     console.log(`    🔍 Found ${sigData.result.length} transaction signatures`);
     
-    // Get ALL transactions (up to 100)
     const transactions = [];
     const signatures = sigData.result.map(s => s.signature);
     
@@ -218,21 +220,17 @@ async function analyzeWalletProfitFromHelius(address) {
     let lastTradeDate = null;
     let fundingSource = null;
     
-    // Analyze each transaction
     for (const tx of transactions) {
       if (!tx || tx.meta?.err) continue;
       
-      // Track last trade date
       if (tx.blockTime && (!lastTradeDate || tx.blockTime > lastTradeDate)) {
         lastTradeDate = tx.blockTime;
       }
       
-      // Detect funding source (first incoming SOL transfer with no token activity)
       if (!fundingSource && !tx.meta?.postTokenBalances?.length) {
         const preBalance = tx.meta?.preBalances?.[0] || 0;
         const postBalance = tx.meta?.postBalances?.[0] || 0;
-        if (postBalance > preBalance + 100000000) { // Received >0.1 SOL
-          // The sender might be a funding source
+        if (postBalance > preBalance + 100000000) {
           const accountKeys = tx.transaction?.message?.accountKeys;
           if (accountKeys && accountKeys.length > 1) {
             const sender = typeof accountKeys[1] === 'string' ? accountKeys[1] : accountKeys[1]?.pubkey;
@@ -241,7 +239,6 @@ async function analyzeWalletProfitFromHelius(address) {
         }
       }
       
-      // Count swaps and track tokens
       const hasTokenChange = tx.meta?.postTokenBalances?.length > 0;
       if (hasTokenChange) {
         swapCount++;
@@ -250,7 +247,6 @@ async function analyzeWalletProfitFromHelius(address) {
           if (balance.mint) tokensTraded.add(balance.mint);
         }
         
-        // Calculate profit/loss for this individual trade
         const preBalance = tx.meta?.preBalances?.[0] || 0;
         const postBalance = tx.meta?.postBalances?.[0] || 0;
         const fee = tx.meta?.fee || 0;
@@ -260,7 +256,6 @@ async function analyzeWalletProfitFromHelius(address) {
         else if (tradeProfit < -0.001) losingTrades++;
       }
       
-      // Calculate overall SOL flow
       const preBalance = tx.meta?.preBalances?.[0] || 0;
       const postBalance = tx.meta?.postBalances?.[0] || 0;
       const fee = tx.meta?.fee || 0;
@@ -279,7 +274,6 @@ async function analyzeWalletProfitFromHelius(address) {
     const totalTrades = profitableTrades + losingTrades;
     const winRate = totalTrades > 0 ? (profitableTrades / totalTrades) * 100 : 0;
     
-    // Format last trade date
     const lastTradeDays = lastTradeDate ? Math.floor((Date.now() / 1000 - lastTradeDate) / 86400) : null;
     
     console.log(`    📈 ${transactions.length} txs, ${swapCount} swaps`);
@@ -307,6 +301,192 @@ async function analyzeWalletProfitFromHelius(address) {
   } catch (err) {
     console.log(`    ⚠️ Profit analysis error:`, err.message);
     return { profit: 0, profitUSD: 0, swapCount: 0, tokenCount: 0, winRate: 0, lastTradeDate: null, fundingSource: null };
+  }
+}
+
+async function monitorWallet(address) {
+  try {
+    const sigRes = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getSignaturesForAddress',
+          params: [address, { limit: 5 }]
+        })
+      }
+    );
+    
+    const sigData = await sigRes.json();
+    if (sigData.error || !sigData.result || sigData.result.length === 0) return;
+    
+    const latestSig = sigData.result[0].signature;
+    const lastSeen = lastSeenSignatures.get(address);
+    
+    // First time monitoring this wallet
+    if (!lastSeen) {
+      lastSeenSignatures.set(address, latestSig);
+      return;
+    }
+    
+    // No new transactions
+    if (latestSig === lastSeen) return;
+    
+    // New transaction detected! Analyze it
+    console.log(`🔔 New transaction from ${address.slice(0, 8)}...${address.slice(-4)}`);
+    
+    const txRes = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransaction',
+          params: [latestSig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]
+        })
+      }
+    );
+    
+    const txData = await txRes.json();
+    if (!txData.result || txData.result.meta?.err) {
+      lastSeenSignatures.set(address, latestSig);
+      return;
+    }
+    
+    const tx = txData.result;
+    
+    // Check if this is a token swap
+    const hasTokenChange = tx.meta?.postTokenBalances?.length > 0;
+    if (!hasTokenChange) {
+      lastSeenSignatures.set(address, latestSig);
+      return;
+    }
+    
+    // Determine what tokens were involved
+    const preBalances = tx.meta?.preTokenBalances || [];
+    const postBalances = tx.meta?.postTokenBalances || [];
+    
+    let boughtToken = null;
+    let soldToken = null;
+    let solSpent = 0;
+    
+    // Find bought token (increased balance)
+    for (const post of postBalances) {
+      const pre = preBalances.find(p => p.accountIndex === post.accountIndex);
+      const preAmount = pre ? parseFloat(pre.uiTokenAmount?.uiAmount || 0) : 0;
+      const postAmount = parseFloat(post.uiTokenAmount?.uiAmount || 0);
+      
+      if (postAmount > preAmount) {
+        boughtToken = post.mint;
+      }
+    }
+    
+    // Find sold token (decreased balance)
+    for (const pre of preBalances) {
+      const post = postBalances.find(p => p.accountIndex === pre.accountIndex);
+      const preAmount = parseFloat(pre.uiTokenAmount?.uiAmount || 0);
+      const postAmount = post ? parseFloat(post.uiTokenAmount?.uiAmount || 0) : 0;
+      
+      if (postAmount < preAmount) {
+        soldToken = pre.mint;
+      }
+    }
+    
+    // Calculate SOL spent/received
+    const preBalance = tx.meta?.preBalances?.[0] || 0;
+    const postBalance = tx.meta?.postBalances?.[0] || 0;
+    solSpent = (preBalance - postBalance) / 1e9;
+    
+    // Create alert
+    const wallet = trackedWallets.get(address);
+    const tokenInfo = boughtToken ? getTokenInfo(boughtToken) : null;
+    
+    if (boughtToken && solSpent > 0.01) { // Only alert if they bought something with >0.01 SOL
+      const alert = {
+        timestamp: Date.now(),
+        wallet: address,
+        walletShort: `${address.slice(0, 6)}...${address.slice(-4)}`,
+        action: 'BUY',
+        token: boughtToken,
+        tokenSymbol: tokenInfo?.symbol || boughtToken.slice(0, 8),
+        amount: solSpent.toFixed(3),
+        signature: latestSig,
+        winRate: wallet?.winRate || 0,
+        totalProfit: wallet?.profitUSD || 0
+      };
+      
+      activeAlerts.set(`${address}-${Date.now()}`, alert);
+      
+      // Send Telegram alert
+      const msg = `🚨 <b>SMART MONEY ALERT!</b>
+
+👤 Wallet: <a href="https://solscan.io/account/${address}">${alert.walletShort}</a>
+📊 Win Rate: ${alert.winRate.toFixed(1)}% | Profit: $${alert.totalProfit.toFixed(2)}
+
+💰 <b>BOUGHT ${alert.tokenSymbol}</b>
+Amount: ${alert.amount} SOL
+
+📋 <b>Contract Address:</b>
+<code>${boughtToken}</code>
+
+🔗 <a href="https://solscan.io/token/${boughtToken}">View on Solscan</a>
+🔗 <a href="https://dexscreener.com/solana/${boughtToken}">View on DexScreener</a>
+
+📝 <a href="https://solscan.io/tx/${latestSig}">View Transaction</a>`;
+      
+      await sendTelegram(msg);
+      console.log(`✅ Alert sent for ${alert.tokenSymbol}`);
+    }
+    
+    lastSeenSignatures.set(address, latestSig);
+    
+  } catch (err) {
+    console.error(`Error monitoring ${address.slice(0, 8)}:`, err.message);
+  }
+}
+
+async function monitorAllWallets() {
+  if (trackedWallets.size === 0) {
+    console.log('⏸️  No wallets to monitor yet');
+    return;
+  }
+  
+  console.log(`\n🔍 Monitoring ${trackedWallets.size} wallets...`);
+  
+  for (const [address, wallet] of trackedWallets.entries()) {
+    await monitorWallet(address);
+    await new Promise(r => setTimeout(r, 300)); // Rate limiting
+  }
+  
+  console.log(`✅ Monitor cycle complete (${trackedWallets.size} wallets checked)`);
+}
+
+function startMonitoring() {
+  if (monitoringInterval) {
+    console.log('⚠️  Monitoring already running');
+    return;
+  }
+  
+  console.log('🚀 Starting wallet monitoring...');
+  console.log(`📊 Checking every 2 minutes`);
+  
+  // Initial check
+  monitorAllWallets();
+  
+  // Check every 2 minutes
+  monitoringInterval = setInterval(monitorAllWallets, 2 * 60 * 1000);
+}
+
+function stopMonitoring() {
+  if (monitoringInterval) {
+    clearInterval(monitoringInterval);
+    monitoringInterval = null;
+    console.log('🛑 Monitoring stopped');
   }
 }
 
@@ -400,7 +580,6 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     
     const analysis = await analyzeWalletProfitFromHelius(wallet.address);
     
-    // Track funding clusters
     if (analysis.fundingSource) {
       if (!walletClusters.has(analysis.fundingSource)) {
         walletClusters.set(analysis.fundingSource, []);
@@ -408,11 +587,10 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       walletClusters.get(analysis.fundingSource).push(wallet.address);
     }
     
-    // Enhanced filtering: profitable + good win rate + recently active
     const isGoodTrader = (
-      (analysis.profitUSD >= 50 && analysis.winRate >= 40) || // Profitable with decent win rate
-      (analysis.profitUSD >= 100 && analysis.winRate >= 30) || // Very profitable, lower win rate OK
-      (analysis.profitUSD >= 10 && analysis.winRate >= 60 && analysis.swapCount >= 15) // Consistent winner
+      (analysis.profitUSD >= 50 && analysis.winRate >= 40) ||
+      (analysis.profitUSD >= 100 && analysis.winRate >= 30) ||
+      (analysis.profitUSD >= 10 && analysis.winRate >= 60 && analysis.swapCount >= 15)
     );
     
     const isRecentlyActive = !analysis.lastTradeDays || analysis.lastTradeDays <= 7;
@@ -447,7 +625,6 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     }
   }
   
-  // Detect wallet clusters
   const clusters = Array.from(walletClusters.entries())
     .filter(([source, wallets]) => wallets.length >= 2)
     .map(([source, wallets]) => ({ fundingSource: source, wallets, count: wallets.length }));
@@ -459,7 +636,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     }
   }
   
-  // Track profitable wallets
+  // Track profitable wallets and start monitoring
   for (const wallet of profitable) {
     trackedWallets.set(wallet.address, {
       address: wallet.address,
@@ -473,11 +650,21 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     });
   }
   
+  // Start monitoring if we have tracked wallets
+  if (trackedWallets.size > 0 && !monitoringInterval) {
+    startMonitoring();
+  }
+  
   // Send Telegram alert
   if (profitable.length > 0 && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-    const msg = `🎯 <b>Smart Money Found!</b>\n\n${profitable.slice(0, 5).map(w => 
-      `<code>${w.address.slice(0, 6)}...${w.address.slice(-4)}</code>\n💰 $${w.profitUSD.toFixed(2)} | WR: ${w.winRate.toFixed(1)}% | ${w.totalTokens} tokens`
-    ).join('\n\n')}`;
+    const msg = `🎯 <b>Smart Money Found & Tracking!</b>
+
+${profitable.slice(0, 5).map(w => 
+      `<code>${w.address.slice(0, 6)}...${w.address.slice(-4)}</code>
+💰 $${w.profitUSD.toFixed(2)} | WR: ${w.winRate.toFixed(1)}% | ${w.totalTokens} tokens`
+    ).join('\n\n')}
+
+🔔 Now monitoring ${trackedWallets.size} wallets for new trades!`;
     await sendTelegram(msg);
   }
   
@@ -486,7 +673,8 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     stats: {
       tokensAnalyzed: tokens.length,
       walletsScanned: walletList.length,
-      smartMoneyFound: profitable.length
+      smartMoneyFound: profitable.length,
+      nowTracking: trackedWallets.size
     },
     clusters
   };
@@ -499,7 +687,8 @@ app.get('/api/discover', async (req, res) => {
     res.json({
       success: true,
       ...result,
-      telegramEnabled: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID)
+      telegramEnabled: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
+      monitoring: !!monitoringInterval
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -511,6 +700,10 @@ app.post('/api/track/:address', async (req, res) => {
   if (trackedWallets.has(address)) return res.json({ success: false, message: 'Already tracked' });
   
   trackedWallets.set(address, { address, addedAt: Date.now(), alerts: [] });
+  
+  if (trackedWallets.size > 0 && !monitoringInterval) {
+    startMonitoring();
+  }
   
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     await sendTelegram(`✅ <b>Tracking</b>\n\n<code>${address.slice(0, 6)}...${address.slice(-4)}</code>\n\nTotal: ${trackedWallets.size}`);
@@ -525,6 +718,11 @@ app.delete('/api/track/:address', (req, res) => {
   
   trackedWallets.delete(address);
   activeAlerts.delete(address);
+  lastSeenSignatures.delete(address);
+  
+  if (trackedWallets.size === 0) {
+    stopMonitoring();
+  }
   
   res.json({ success: true, trackedCount: trackedWallets.size });
 });
@@ -533,7 +731,17 @@ app.get('/api/tracked', (req, res) => {
   res.json({
     success: true,
     trackedWallets: Array.from(trackedWallets.values()),
-    count: trackedWallets.size
+    count: trackedWallets.size,
+    monitoring: !!monitoringInterval
+  });
+});
+
+app.get('/api/alerts', (req, res) => {
+  res.json({
+    success: true,
+    alerts: Array.from(activeAlerts.values())
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 50)
   });
 });
 
@@ -548,20 +756,62 @@ app.get('/api/clusters', (req, res) => {
   });
 });
 
+app.post('/api/monitoring/start', (req, res) => {
+  if (trackedWallets.size === 0) {
+    return res.json({ success: false, message: 'No wallets to monitor. Run discovery first.' });
+  }
+  startMonitoring();
+  res.json({ success: true, message: `Monitoring ${trackedWallets.size} wallets` });
+});
+
+app.post('/api/monitoring/stop', (req, res) => {
+  stopMonitoring();
+  res.json({ success: true, message: 'Monitoring stopped' });
+});
+
+app.post('/api/monitoring/clear', (req, res) => {
+  stopMonitoring();
+  const count = trackedWallets.size;
+  trackedWallets.clear();
+  activeAlerts.clear();
+  lastSeenSignatures.clear();
+  walletClusters.clear();
+  res.json({ success: true, message: `Cleared ${count} tracked wallets` });
+});
+
+app.get('/api/monitoring/status', (req, res) => {
+  res.json({
+    success: true,
+    monitoring: !!monitoringInterval,
+    walletsTracked: trackedWallets.size,
+    alertsCount: activeAlerts.size
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({
-    status: 'Elite Tracker v5.2 - Enhanced Analysis',
+    status: 'Elite Tracker v6.0 - Real-time Monitoring',
     helius: { configured: !!HELIUS_API_KEY },
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     manualTokens: {
       enabled: !!TARGET_TOKENS,
       count: TARGET_TOKENS ? TARGET_TOKENS.split(',').length : 0
     },
+    monitoring: {
+      active: !!monitoringInterval,
+      walletsTracked: trackedWallets.size,
+      alerts: activeAlerts.size
+    },
     endpoints: {
       discover: '/api/discover?top=10',
       track: 'POST /api/track/:address',
       tracked: '/api/tracked',
-      clusters: '/api/clusters'
+      alerts: '/api/alerts',
+      clusters: '/api/clusters',
+      monitoringStart: 'POST /api/monitoring/start',
+      monitoringStop: 'POST /api/monitoring/stop',
+      monitoringClear: 'POST /api/monitoring/clear',
+      monitoringStatus: '/api/monitoring/status'
     }
   });
 });
@@ -569,7 +819,7 @@ app.get('/', (req, res) => {
 loadTokens();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v5.2 - Enhanced Analysis');
+  console.log('🚀 Elite Tracker v6.0 - Real-time Monitoring');
   console.log(`📱 Telegram: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌'}`);
   console.log(`🔑 Helius: ${HELIUS_API_KEY ? '✅' : '❌'}`);
   console.log(`📋 Manual Tokens: ${TARGET_TOKENS ? `✅ (${TARGET_TOKENS.split(',').length} tokens)` : '❌'}`);
