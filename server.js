@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const SOLSCAN_API_KEY = process.env.SOLSCAN_API_KEY;
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TARGET_TOKENS = process.env.TARGET_TOKENS || '';
@@ -54,105 +54,158 @@ function getTokenInfo(mint) {
   return knownTokens.get(mint) || { symbol: mint.slice(0, 8), name: 'Unknown' };
 }
 
-async function getTokenBuyersFromSolscan(tokenAddress) {
+async function getTokenBuyersFromHelius(tokenAddress) {
   const walletMap = new Map();
   
   try {
-    console.log(`    🔍 Fetching transfers for ${tokenAddress.slice(0, 8)}...`);
+    console.log(`    🔍 Fetching signatures for ${tokenAddress.slice(0, 8)}...`);
     
-    // Try the correct Solscan v2 endpoint
-    const res = await fetch(
-      `https://pro-api.solscan.io/v2.0/token/transfer?address=${tokenAddress}&page=1&page_size=100&remove_spam=true`,
+    // Get recent signatures for the token account
+    const sigRes = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
       {
-        headers: {
-          'token': SOLSCAN_API_KEY,
-          'accept': 'application/json'
-        }
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getSignaturesForAddress',
+          params: [tokenAddress, { limit: 100 }]
+        })
       }
     );
     
-    if (!res.ok) {
-      console.log(`    ⚠️ Solscan error: ${res.status} ${res.statusText}`);
-      const errorText = await res.text();
-      console.log(`    🔍 Error response: ${errorText.slice(0, 200)}`);
+    const sigData = await sigRes.json();
+    
+    if (sigData.error) {
+      console.log(`    ⚠️ Helius error: ${sigData.error.message}`);
       return [];
     }
     
-    const data = await res.json();
-    
-    console.log(`    🔍 DEBUG - Response status: ${res.status}`);
-    console.log(`    🔍 DEBUG - Data structure:`, Object.keys(data));
-    console.log(`    🔍 DEBUG - Data length: ${data.data?.length || 0}`);
-    
-    if (!data.data || !Array.isArray(data.data)) {
-      console.log(`    ⚠️ No transfer data returned`);
+    if (!sigData.result || sigData.result.length === 0) {
+      console.log(`    ⚠️ No signatures found`);
       return [];
     }
     
-    for (const transfer of data.data) {
-      const buyer = transfer.to_address;
-      const amount = parseFloat(transfer.amount || 0);
-      const timestamp = transfer.block_time;
+    console.log(`    📊 Found ${sigData.result.length} signatures, analyzing...`);
+    
+    // Get transaction details
+    const signatures = sigData.result.slice(0, 50).map(s => s.signature); // Limit to 50 to avoid rate limits
+    
+    const txRes = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransactions',
+          params: [signatures]
+        })
+      }
+    );
+    
+    const txData = await txRes.json();
+    
+    if (txData.error) {
+      console.log(`    ⚠️ Helius tx error: ${txData.error.message}`);
+      return [];
+    }
+    
+    // Parse transactions to find buyers
+    for (const tx of txData.result || []) {
+      if (!tx || tx.meta?.err) continue;
       
-      if (!buyer || BLACKLISTED.has(buyer)) continue;
-      if (amount < 0.000001) continue;
+      const accounts = tx.transaction?.message?.accountKeys || [];
+      if (accounts.length < 2) continue;
       
-      if (!walletMap.has(buyer)) {
-        walletMap.set(buyer, {
-          address: buyer,
-          firstSeen: timestamp,
+      // First non-program account is usually the signer (buyer)
+      const signer = accounts[0];
+      if (!signer || typeof signer !== 'string') continue;
+      if (BLACKLISTED.has(signer)) continue;
+      
+      // Check if this is a token transfer
+      const hasTokenTransfer = tx.meta?.postTokenBalances?.length > 0;
+      if (!hasTokenTransfer) continue;
+      
+      if (!walletMap.has(signer)) {
+        walletMap.set(signer, {
+          address: signer,
+          firstSeen: tx.blockTime || Date.now() / 1000,
           buyCount: 0,
           totalAmount: 0
         });
       }
       
-      const wallet = walletMap.get(buyer);
+      const wallet = walletMap.get(signer);
       wallet.buyCount++;
-      wallet.totalAmount += amount;
     }
     
     const buyers = Array.from(walletMap.values())
       .sort((a, b) => a.firstSeen - b.firstSeen);
     
-    console.log(`    📊 Found ${buyers.length} unique buyers from ${data.data.length} transfers`);
+    console.log(`    📊 Found ${buyers.length} unique buyers from ${signatures.length} transactions`);
     
     return buyers;
     
   } catch (err) {
-    console.log(`    ⚠️ Solscan fetch error:`, err.message);
+    console.log(`    ⚠️ Helius fetch error:`, err.message);
     return [];
   }
 }
 
-async function analyzeWalletProfitFromSolscan(address) {
+async function analyzeWalletProfitFromHelius(address) {
   try {
     await new Promise(r => setTimeout(r, 500));
     
     console.log(`    🔍 Fetching transaction history...`);
     
-    const res = await fetch(
-      `https://pro-api.solscan.io/v2.0/account/transaction?address=${address}&page=1&page_size=100`,
+    // Get wallet signatures
+    const sigRes = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
       {
-        headers: {
-          'token': SOLSCAN_API_KEY,
-          'accept': 'application/json'
-        }
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getSignaturesForAddress',
+          params: [address, { limit: 100 }]
+        })
       }
     );
     
-    if (!res.ok) {
-      console.log(`    ⚠️ Solscan error: ${res.status} ${res.statusText}`);
+    const sigData = await sigRes.json();
+    
+    if (sigData.error || !sigData.result) {
+      console.log(`    ⚠️ No transaction data`);
       return { profit: 0, profitUSD: 0, swapCount: 0, tokenCount: 0 };
     }
     
-    const data = await res.json();
+    console.log(`    🔍 DEBUG - Found ${sigData.result.length} transactions`);
     
-    console.log(`    🔍 DEBUG - API Status: ${res.status}`);
-    console.log(`    🔍 DEBUG - Has data: ${!!data.data}`);
-    console.log(`    🔍 DEBUG - Transactions count: ${data.data?.length || 0}`);
+    // Get detailed transactions
+    const signatures = sigData.result.slice(0, 50).map(s => s.signature);
     
-    if (!data.data || !Array.isArray(data.data)) {
-      console.log(`    ⚠️ No transaction data`);
+    const txRes = await fetch(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransactions',
+          params: [signatures]
+        })
+      }
+    );
+    
+    const txData = await txRes.json();
+    
+    if (txData.error || !txData.result) {
+      console.log(`    ⚠️ Error fetching transaction details`);
       return { profit: 0, profitUSD: 0, swapCount: 0, tokenCount: 0 };
     }
     
@@ -161,35 +214,39 @@ async function analyzeWalletProfitFromSolscan(address) {
     let swapCount = 0;
     const tokensTraded = new Set();
     
-    for (const tx of data.data) {
-      if (!tx.parsedInstruction || tx.parsedInstruction.length === 0) continue;
+    // Analyze transactions
+    for (const tx of txData.result) {
+      if (!tx || tx.meta?.err) continue;
       
-      for (const instruction of tx.parsedInstruction) {
-        if (instruction.type === 'swap' || instruction.program === 'raydium' || instruction.program === 'jupiter') {
-          swapCount++;
-          
-          if (instruction.params) {
-            if (instruction.params.source) tokensTraded.add(instruction.params.source);
-            if (instruction.params.destination) tokensTraded.add(instruction.params.destination);
-          }
+      // Count swaps (transactions with token balance changes)
+      const hasTokenChange = tx.meta?.postTokenBalances?.length > 0;
+      if (hasTokenChange) {
+        swapCount++;
+        
+        // Track unique tokens
+        for (const balance of tx.meta.postTokenBalances || []) {
+          if (balance.mint) tokensTraded.add(balance.mint);
         }
       }
       
-      if (tx.lamportChange) {
-        const solChange = Math.abs(tx.lamportChange) / 1e9;
-        
-        if (tx.lamportChange < 0) {
-          solSpent += solChange;
-        } else if (tx.lamportChange > 0) {
-          solReceived += solChange;
-        }
+      // Calculate SOL flow from pre/post balances
+      const preBalance = tx.meta?.preBalances?.[0] || 0;
+      const postBalance = tx.meta?.postBalances?.[0] || 0;
+      const fee = tx.meta?.fee || 0;
+      
+      const netChange = (postBalance - preBalance + fee) / 1e9; // Convert lamports to SOL
+      
+      if (netChange < 0) {
+        solSpent += Math.abs(netChange);
+      } else if (netChange > 0) {
+        solReceived += netChange;
       }
     }
     
     const profitSOL = solReceived - solSpent;
-    const profitUSD = profitSOL * 180;
+    const profitUSD = profitSOL * 180; // Approximate SOL price
     
-    console.log(`    📈 ${data.data.length} txs, ${swapCount} swaps`);
+    console.log(`    📈 ${txData.result.length} txs, ${swapCount} swaps`);
     console.log(`    📈 Spent: ${solSpent.toFixed(3)} SOL | Received: ${solReceived.toFixed(3)} SOL`);
     console.log(`    💰 Profit: $${profitUSD.toFixed(2)} (${profitSOL.toFixed(3)} SOL) | Tokens: ${tokensTraded.size}`);
     
@@ -207,10 +264,10 @@ async function analyzeWalletProfitFromSolscan(address) {
 }
 
 async function discoverSmartMoney(limit = 20, topN = 5) {
-  console.log('\n=== SMART MONEY DISCOVERY (Solscan) ===');
+  console.log('\n=== SMART MONEY DISCOVERY (Helius) ===');
   
-  if (!SOLSCAN_API_KEY) {
-    console.error('❌ SOLSCAN_API_KEY not configured!');
+  if (!HELIUS_API_KEY) {
+    console.error('❌ HELIUS_API_KEY not configured!');
     return { discoveredWallets: [], stats: {} };
   }
   
@@ -233,7 +290,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     const info = getTokenInfo(mint);
     console.log(`\n[${tokenIndex}/${tokens.length}] ${info.symbol}...`);
     
-    const buyers = await getTokenBuyersFromSolscan(mint);
+    const buyers = await getTokenBuyersFromHelius(mint);
     
     if (buyers.length === 0) {
       console.log('  ⚠️ No buyers found');
@@ -258,12 +315,13 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       const w = scores[wallet];
       w.totalTokens++;
       
+      // Reward early entry
       const buyerRank = buyers.findIndex(b => b.address === wallet);
       const percentile = buyerRank / buyers.length;
       
-      if (percentile <= 0.05) w.earlyEntryScore += 15;
-      else if (percentile <= 0.10) w.earlyEntryScore += 10;
-      else if (percentile <= 0.20) w.earlyEntryScore += 5;
+      if (percentile <= 0.05) w.earlyEntryScore += 15;      // Top 5%
+      else if (percentile <= 0.10) w.earlyEntryScore += 10; // Top 10%
+      else if (percentile <= 0.20) w.earlyEntryScore += 5;  // Top 20%
     }
     
     const topWallet = Object.values(scores).sort((a, b) => b.totalTokens - a.totalTokens)[0];
@@ -271,7 +329,8 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       console.log(`  🔝 Top wallet bought ${topWallet.totalTokens} of your tokens`);
     }
     
-    await new Promise(r => setTimeout(r, 1000));
+    // Rate limiting
+    await new Promise(r => setTimeout(r, 1500));
   }
   
   const walletList = Object.values(scores);
@@ -294,8 +353,9 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     console.log(`\nAnalyzing ${wallet.address.slice(0, 8)}...${wallet.address.slice(-4)}`);
     console.log(`  📌 Bought ${wallet.totalTokens} of your tokens | Early entry score: ${wallet.earlyEntryScore}`);
     
-    const analysis = await analyzeWalletProfitFromSolscan(wallet.address);
+    const analysis = await analyzeWalletProfitFromHelius(wallet.address);
     
+    // Lower threshold for testing - just need active trading
     if (analysis.profitUSD >= 5 || analysis.profit >= 0.05 || analysis.swapCount >= 10) {
       console.log(`  ✅ SMART MONEY WALLET!`);
       profitable.push({
@@ -306,7 +366,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       console.log(`  ❌ Not enough trading activity`);
     }
     
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 1500)); // Rate limiting
   }
   
   console.log(`\n\n🎯 === RESULTS ===`);
@@ -321,6 +381,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     }
   }
   
+  // Track profitable wallets
   for (const wallet of profitable) {
     trackedWallets.set(wallet.address, {
       address: wallet.address,
@@ -332,6 +393,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     });
   }
   
+  // Send Telegram alert
   if (profitable.length > 0 && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     const msg = `🎯 <b>Smart Money Found!</b>\n\n${profitable.slice(0, 5).map(w => 
       `<code>${w.address.slice(0, 6)}...${w.address.slice(-4)}</code>\n💰 $${w.profitUSD.toFixed(2)} | ${w.swapCount} trades | ${w.totalTokens} of your tokens`
@@ -396,8 +458,8 @@ app.get('/api/tracked', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({
-    status: 'Elite Tracker v5.0 - Solscan Integration',
-    solscan: { configured: !!SOLSCAN_API_KEY },
+    status: 'Elite Tracker v5.1 - Helius Integration',
+    helius: { configured: !!HELIUS_API_KEY },
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     manualTokens: {
       enabled: !!TARGET_TOKENS,
@@ -414,8 +476,8 @@ app.get('/', (req, res) => {
 loadTokens();
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v5.0 - Solscan Integration');
+  console.log('🚀 Elite Tracker v5.1 - Helius Integration');
   console.log(`📱 Telegram: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌'}`);
-  console.log(`🔑 Solscan: ${SOLSCAN_API_KEY ? '✅' : '❌'}`);
+  console.log(`🔑 Helius: ${HELIUS_API_KEY ? '✅' : '❌'}`);
   console.log(`📋 Manual Tokens: ${TARGET_TOKENS ? `✅ (${TARGET_TOKENS.split(',').length} tokens)` : '❌'}`);
 });
