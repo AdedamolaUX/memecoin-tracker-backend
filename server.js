@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const fetch = require('node-fetch');
+const sqlite3 = require('sqlite3').verbose();
 const app = express();
 app.use(express.json());
 
@@ -23,13 +24,52 @@ const BLACKLISTED = new Set([
   '2fPCxpdcAqm51CpM5CaSqCzY8XWfSg9Y9RAsSwXWR7tY',
 ]);
 
+// Initialize SQLite database
+const db = new sqlite3.Database('./tracker.db', (err) => {
+  if (err) {
+    console.error('❌ Database error:', err);
+  } else {
+    console.log('✅ Database connected');
+  }
+});
+
+// Create tables
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS tracked_wallets (
+    address TEXT PRIMARY KEY,
+    added_at INTEGER,
+    profit_usd REAL,
+    profit_sol REAL,
+    win_rate REAL,
+    total_tokens INTEGER,
+    swap_count INTEGER,
+    last_trade INTEGER,
+    last_signature TEXT
+  )`);
+  
+  db.run(`CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER,
+    wallet TEXT,
+    action TEXT,
+    token TEXT,
+    token_symbol TEXT,
+    amount REAL,
+    signature TEXT
+  )`);
+  
+  console.log('✅ Database tables ready');
+});
+
 let knownTokens = new Map();
 const trackedWallets = new Map();
 const activeAlerts = new Map();
 const walletClusters = new Map();
-const lastSeenSignatures = new Map(); // Track last seen tx for each wallet
+const lastSeenSignatures = new Map();
 
 let monitoringInterval = null;
+let dailyDiscoveryInterval = null;
+let lastDiscoveryTime = 0;
 
 async function sendTelegram(msg) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
@@ -37,7 +77,7 @@ async function sendTelegram(msg) {
     const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: 'HTML' })
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg, parse_mode: 'HTML', disable_web_page_preview: true })
     });
     return res.ok;
   } catch { return false; }
@@ -56,6 +96,89 @@ async function loadTokens() {
 
 function getTokenInfo(mint) {
   return knownTokens.get(mint) || { symbol: mint.slice(0, 8), name: 'Unknown' };
+}
+
+// Load tracked wallets from database
+function loadTrackedWallets() {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT * FROM tracked_wallets', [], (err, rows) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      
+      trackedWallets.clear();
+      lastSeenSignatures.clear();
+      
+      for (const row of rows) {
+        trackedWallets.set(row.address, {
+          address: row.address,
+          addedAt: row.added_at,
+          profitUSD: row.profit_usd,
+          profitSOL: row.profit_sol,
+          winRate: row.win_rate,
+          tokens: row.total_tokens,
+          swaps: row.swap_count,
+          lastTrade: row.last_trade
+        });
+        
+        if (row.last_signature) {
+          lastSeenSignatures.set(row.address, row.last_signature);
+        }
+      }
+      
+      console.log(`✅ Loaded ${trackedWallets.size} tracked wallets from database`);
+      resolve(trackedWallets.size);
+    });
+  });
+}
+
+// Save wallet to database
+function saveWalletToDB(wallet) {
+  return new Promise((resolve, reject) => {
+    db.run(`INSERT OR REPLACE INTO tracked_wallets 
+      (address, added_at, profit_usd, profit_sol, win_rate, total_tokens, swap_count, last_trade, last_signature)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        wallet.address,
+        wallet.addedAt || Date.now(),
+        wallet.profitUSD || 0,
+        wallet.profitSOL || 0,
+        wallet.winRate || 0,
+        wallet.tokens || 0,
+        wallet.swaps || 0,
+        wallet.lastTrade || null,
+        lastSeenSignatures.get(wallet.address) || null
+      ],
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      }
+    );
+  });
+}
+
+// Save alert to database
+function saveAlertToDB(alert) {
+  return new Promise((resolve, reject) => {
+    db.run(`INSERT INTO alerts 
+      (timestamp, wallet, action, token, token_symbol, amount, signature)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        alert.timestamp,
+        alert.wallet,
+        alert.action,
+        alert.token,
+        alert.tokenSymbol,
+        alert.amount,
+        alert.signature
+      ],
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      }
+    );
+  });
 }
 
 async function getTokenBuyersFromHelius(tokenAddress) {
@@ -280,10 +403,6 @@ async function analyzeWalletProfitFromHelius(address) {
     console.log(`    💰 Profit: $${profitUSD.toFixed(2)} (${profitSOL.toFixed(3)} SOL)`);
     console.log(`    📊 Win Rate: ${winRate.toFixed(1)}% (${profitableTrades}W/${losingTrades}L)`);
     console.log(`    🕒 Last Trade: ${lastTradeDays !== null ? `${lastTradeDays} days ago` : 'Unknown'}`);
-    console.log(`    💼 Tokens Traded: ${tokensTraded.size}`);
-    if (fundingSource) {
-      console.log(`    🏦 Funding Source: ${fundingSource.slice(0, 6)}...${fundingSource.slice(-4)}`);
-    }
     
     return {
       profit: profitSOL,
@@ -326,16 +445,14 @@ async function monitorWallet(address) {
     const latestSig = sigData.result[0].signature;
     const lastSeen = lastSeenSignatures.get(address);
     
-    // First time monitoring this wallet
     if (!lastSeen) {
       lastSeenSignatures.set(address, latestSig);
+      await saveWalletToDB({ address, addedAt: Date.now() });
       return;
     }
     
-    // No new transactions
     if (latestSig === lastSeen) return;
     
-    // New transaction detected! Analyze it
     console.log(`🔔 New transaction from ${address.slice(0, 8)}...${address.slice(-4)}`);
     
     const txRes = await fetch(
@@ -355,27 +472,25 @@ async function monitorWallet(address) {
     const txData = await txRes.json();
     if (!txData.result || txData.result.meta?.err) {
       lastSeenSignatures.set(address, latestSig);
+      await saveWalletToDB({ address, addedAt: Date.now() });
       return;
     }
     
     const tx = txData.result;
     
-    // Check if this is a token swap
     const hasTokenChange = tx.meta?.postTokenBalances?.length > 0;
     if (!hasTokenChange) {
       lastSeenSignatures.set(address, latestSig);
+      await saveWalletToDB({ address, addedAt: Date.now() });
       return;
     }
     
-    // Determine what tokens were involved
     const preBalances = tx.meta?.preTokenBalances || [];
     const postBalances = tx.meta?.postTokenBalances || [];
     
     let boughtToken = null;
-    let soldToken = null;
     let solSpent = 0;
     
-    // Find bought token (increased balance)
     for (const post of postBalances) {
       const pre = preBalances.find(p => p.accountIndex === post.accountIndex);
       const preAmount = pre ? parseFloat(pre.uiTokenAmount?.uiAmount || 0) : 0;
@@ -386,27 +501,14 @@ async function monitorWallet(address) {
       }
     }
     
-    // Find sold token (decreased balance)
-    for (const pre of preBalances) {
-      const post = postBalances.find(p => p.accountIndex === pre.accountIndex);
-      const preAmount = parseFloat(pre.uiTokenAmount?.uiAmount || 0);
-      const postAmount = post ? parseFloat(post.uiTokenAmount?.uiAmount || 0) : 0;
-      
-      if (postAmount < preAmount) {
-        soldToken = pre.mint;
-      }
-    }
-    
-    // Calculate SOL spent/received
     const preBalance = tx.meta?.preBalances?.[0] || 0;
     const postBalance = tx.meta?.postBalances?.[0] || 0;
     solSpent = (preBalance - postBalance) / 1e9;
     
-    // Create alert
     const wallet = trackedWallets.get(address);
     const tokenInfo = boughtToken ? getTokenInfo(boughtToken) : null;
     
-    if (boughtToken && solSpent > 0.01) { // Only alert if they bought something with >0.01 SOL
+    if (boughtToken && solSpent > 0.01) {
       const alert = {
         timestamp: Date.now(),
         wallet: address,
@@ -421,8 +523,8 @@ async function monitorWallet(address) {
       };
       
       activeAlerts.set(`${address}-${Date.now()}`, alert);
+      await saveAlertToDB(alert);
       
-      // Send Telegram alert
       const msg = `🚨 <b>SMART MONEY ALERT!</b>
 
 👤 Wallet: <a href="https://solscan.io/account/${address}">${alert.walletShort}</a>
@@ -444,6 +546,7 @@ Amount: ${alert.amount} SOL
     }
     
     lastSeenSignatures.set(address, latestSig);
+    await saveWalletToDB({ address, addedAt: Date.now() });
     
   } catch (err) {
     console.error(`Error monitoring ${address.slice(0, 8)}:`, err.message);
@@ -460,7 +563,7 @@ async function monitorAllWallets() {
   
   for (const [address, wallet] of trackedWallets.entries()) {
     await monitorWallet(address);
-    await new Promise(r => setTimeout(r, 300)); // Rate limiting
+    await new Promise(r => setTimeout(r, 300));
   }
   
   console.log(`✅ Monitor cycle complete (${trackedWallets.size} wallets checked)`);
@@ -475,10 +578,7 @@ function startMonitoring() {
   console.log('🚀 Starting wallet monitoring...');
   console.log(`📊 Checking every 2 minutes`);
   
-  // Initial check
   monitorAllWallets();
-  
-  // Check every 2 minutes
   monitoringInterval = setInterval(monitorAllWallets, 2 * 60 * 1000);
 }
 
@@ -636,7 +736,7 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     }
   }
   
-  // Track profitable wallets and start monitoring
+  // Track profitable wallets and save to database
   for (const wallet of profitable) {
     trackedWallets.set(wallet.address, {
       address: wallet.address,
@@ -648,6 +748,8 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
       swaps: wallet.swapCount,
       lastTrade: wallet.lastTradeDate
     });
+    
+    await saveWalletToDB(trackedWallets.get(wallet.address));
   }
   
   // Start monitoring if we have tracked wallets
@@ -655,16 +757,19 @@ async function discoverSmartMoney(limit = 20, topN = 5) {
     startMonitoring();
   }
   
+  lastDiscoveryTime = Date.now();
+  
   // Send Telegram alert
   if (profitable.length > 0 && TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     const msg = `🎯 <b>Smart Money Found & Tracking!</b>
 
 ${profitable.slice(0, 5).map(w => 
-      `<code>${w.address.slice(0, 6)}...${w.address.slice(-4)}</code>
+      `<a href="https://solscan.io/account/${w.address}">${w.address.slice(0, 6)}...${w.address.slice(-4)}</a>
 💰 $${w.profitUSD.toFixed(2)} | WR: ${w.winRate.toFixed(1)}% | ${w.totalTokens} tokens`
     ).join('\n\n')}
 
-🔔 Now monitoring ${trackedWallets.size} wallets for new trades!`;
+🔔 Now monitoring ${trackedWallets.size} wallets!
+💾 Saved to database (survives restarts)`;
     await sendTelegram(msg);
   }
   
@@ -679,6 +784,30 @@ ${profitable.slice(0, 5).map(w =>
     clusters
   };
 }
+
+// Auto-run discovery on startup if wallets exist or every 24 hours
+async function autoDiscoveryScheduler() {
+  const now = Date.now();
+  const timeSinceLastDiscovery = now - lastDiscoveryTime;
+  const twentyFourHours = 24 * 60 * 60 * 1000;
+  
+  // Run discovery if it's been more than 24 hours
+  if (timeSinceLastDiscovery >= twentyFourHours || lastDiscoveryTime === 0) {
+    console.log('\n🤖 AUTO-DISCOVERY: Running scheduled discovery...');
+    await discoverSmartMoney(20, 10);
+  }
+}
+
+// Keep-alive endpoint for UptimeRobot
+app.get('/ping', (req, res) => {
+  res.json({ 
+    status: 'alive', 
+    uptime: process.uptime(),
+    monitoring: !!monitoringInterval,
+    tracked: trackedWallets.size,
+    timestamp: Date.now()
+  });
+});
 
 app.get('/api/discover', async (req, res) => {
   const { limit = 20, top = 10 } = req.query;
@@ -699,7 +828,9 @@ app.post('/api/track/:address', async (req, res) => {
   const { address } = req.params;
   if (trackedWallets.has(address)) return res.json({ success: false, message: 'Already tracked' });
   
-  trackedWallets.set(address, { address, addedAt: Date.now(), alerts: [] });
+  const wallet = { address, addedAt: Date.now(), alerts: [] };
+  trackedWallets.set(address, wallet);
+  await saveWalletToDB(wallet);
   
   if (trackedWallets.size > 0 && !monitoringInterval) {
     startMonitoring();
@@ -712,13 +843,20 @@ app.post('/api/track/:address', async (req, res) => {
   res.json({ success: true, trackedCount: trackedWallets.size });
 });
 
-app.delete('/api/track/:address', (req, res) => {
+app.delete('/api/track/:address', async (req, res) => {
   const { address } = req.params;
   if (!trackedWallets.has(address)) return res.json({ success: false });
   
   trackedWallets.delete(address);
   activeAlerts.delete(address);
   lastSeenSignatures.delete(address);
+  
+  await new Promise((resolve, reject) => {
+    db.run('DELETE FROM tracked_wallets WHERE address = ?', [address], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
   
   if (trackedWallets.size === 0) {
     stopMonitoring();
@@ -737,11 +875,12 @@ app.get('/api/tracked', (req, res) => {
 });
 
 app.get('/api/alerts', (req, res) => {
-  res.json({
-    success: true,
-    alerts: Array.from(activeAlerts.values())
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 50)
+  db.all('SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 50', [], (err, rows) => {
+    if (err) {
+      res.status(500).json({ success: false, error: err.message });
+    } else {
+      res.json({ success: true, alerts: rows });
+    }
   });
 });
 
@@ -769,14 +908,21 @@ app.post('/api/monitoring/stop', (req, res) => {
   res.json({ success: true, message: 'Monitoring stopped' });
 });
 
-app.post('/api/monitoring/clear', (req, res) => {
+app.post('/api/monitoring/clear', async (req, res) => {
   stopMonitoring();
   const count = trackedWallets.size;
   trackedWallets.clear();
   activeAlerts.clear();
   lastSeenSignatures.clear();
   walletClusters.clear();
-  res.json({ success: true, message: `Cleared ${count} tracked wallets` });
+  
+  await new Promise((resolve) => {
+    db.run('DELETE FROM tracked_wallets', [], () => {
+      db.run('DELETE FROM alerts', [], resolve);
+    });
+  });
+  
+  res.json({ success: true, message: `Cleared ${count} tracked wallets and all alerts from database` });
 });
 
 app.get('/api/monitoring/status', (req, res) => {
@@ -784,13 +930,14 @@ app.get('/api/monitoring/status', (req, res) => {
     success: true,
     monitoring: !!monitoringInterval,
     walletsTracked: trackedWallets.size,
-    alertsCount: activeAlerts.size
+    alertsCount: activeAlerts.size,
+    lastDiscovery: lastDiscoveryTime ? new Date(lastDiscoveryTime).toISOString() : 'Never'
   });
 });
 
 app.get('/', (req, res) => {
   res.json({
-    status: 'Elite Tracker v6.0 - Real-time Monitoring',
+    status: 'Elite Tracker v6.1 - Database + Auto-Discovery',
     helius: { configured: !!HELIUS_API_KEY },
     telegram: { configured: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) },
     manualTokens: {
@@ -800,9 +947,15 @@ app.get('/', (req, res) => {
     monitoring: {
       active: !!monitoringInterval,
       walletsTracked: trackedWallets.size,
-      alerts: activeAlerts.size
+      alerts: activeAlerts.size,
+      lastDiscovery: lastDiscoveryTime ? new Date(lastDiscoveryTime).toISOString() : 'Never'
+    },
+    database: {
+      enabled: true,
+      persistence: 'SQLite - Survives restarts'
     },
     endpoints: {
+      ping: '/ping (for UptimeRobot)',
       discover: '/api/discover?top=10',
       track: 'POST /api/track/:address',
       tracked: '/api/tracked',
@@ -816,11 +969,36 @@ app.get('/', (req, res) => {
   });
 });
 
-loadTokens();
+// Initialize on startup
+async function initialize() {
+  await loadTokens();
+  await loadTrackedWallets();
+  
+  if (trackedWallets.size > 0) {
+    console.log(`🔄 Resuming monitoring of ${trackedWallets.size} wallets from database`);
+    startMonitoring();
+  } else {
+    console.log(`🆕 No tracked wallets found. Run discovery to find smart money!`);
+  }
+  
+  // Schedule auto-discovery every 24 hours
+  setInterval(autoDiscoveryScheduler, 60 * 60 * 1000); // Check every hour
+  
+  // Run discovery on startup if no wallets tracked
+  if (trackedWallets.size === 0 && TARGET_TOKENS) {
+    console.log(`\n🚀 AUTO-DISCOVERY: Running initial discovery on startup...`);
+    setTimeout(() => discoverSmartMoney(20, 10), 5000); // Wait 5 seconds after startup
+  }
+}
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('🚀 Elite Tracker v6.0 - Real-time Monitoring');
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log('🚀 Elite Tracker v6.1 - Database + Auto-Discovery');
   console.log(`📱 Telegram: ${TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID ? '✅' : '❌'}`);
   console.log(`🔑 Helius: ${HELIUS_API_KEY ? '✅' : '❌'}`);
   console.log(`📋 Manual Tokens: ${TARGET_TOKENS ? `✅ (${TARGET_TOKENS.split(',').length} tokens)` : '❌'}`);
+  console.log(`💾 Database: ✅ SQLite (Persistent storage)`);
+  console.log(`🤖 Auto-Discovery: ✅ Every 24 hours + On startup`);
+  console.log(`\nSetup UptimeRobot to ping: https://your-app.onrender.com/ping every 5 minutes`);
+  
+  await initialize();
 });
