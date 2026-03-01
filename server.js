@@ -2,8 +2,12 @@ require('dotenv').config();
 const express = require('express');
 const fetch = require('node-fetch');
 const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 const app = express();
 app.use(express.json());
+
+// Serve static files from public directory
+app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3000;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
@@ -508,7 +512,11 @@ async function monitorWallet(address) {
     const wallet = trackedWallets.get(address);
     const tokenInfo = boughtToken ? getTokenInfo(boughtToken) : null;
     
-    if (boughtToken && solSpent > 0.01) {
+    // Filter: Exclude wrapped SOL from alerts
+    const WRAPPED_SOL = 'So11111111111111111111111111111111111111112';
+    const isWrappedSol = boughtToken === WRAPPED_SOL;
+    
+    if (boughtToken && solSpent > 0.01 && !isWrappedSol) {
       const alert = {
         timestamp: Date.now(),
         wallet: address,
@@ -935,7 +943,7 @@ app.get('/api/monitoring/status', (req, res) => {
   });
 });
 
-app.get('/', (req, res) => {
+app.get('/api', (req, res) => {
   res.json({
     status: 'Elite Tracker v6.1 - Database + Auto-Discovery',
     helius: { configured: !!HELIUS_API_KEY },
@@ -955,6 +963,7 @@ app.get('/', (req, res) => {
       persistence: 'SQLite - Survives restarts'
     },
     endpoints: {
+      dashboard: '/ (Web UI)',
       ping: '/ping (for UptimeRobot)',
       discover: '/api/discover?top=10',
       track: 'POST /api/track/:address',
